@@ -12,6 +12,16 @@
 
 > **v4.1:** Windows audio compatibility update: fixes PortAudio `-9993` (`Illegal combination of I/O devices`) by detecting microphone/headphone devices from different host APIs and switching automatically to separate input and output streams. This can add a little monitoring latency but avoids the incompatible duplex pairing. Also retries split mode if opening a same-API duplex stream returns `-9993`.
 
+## Long-term hardware goal: RetroAutoTune MicStation 🎤
+
+**Project direction:** Evolve RetroAutoTune into a standalone, Raspberry Pi-powered vocal-effects microphone/studio housed in a custom **3D-printed microphone enclosure**, with an integrated **touchscreen** and physical controls. The envisioned device will run the voice-reactive Auto-Tune, backing vocals, guitar/bass/drums, MAX CHAOS and recording **without needing a Windows PC**.
+
+This is a **future goal, not an existing supported hardware build**. The Raspberry Pi 5 is an initial candidate; processing latency, CPU performance, Linux audio compatibility, touchscreen usability, thermal limits and recording must be tested before selecting final parts or printing the enclosure.
+
+**Design principle for future changes:** Keep audio processing platform-independent and independent of the desktop GUI; favor scalable, touch-friendly layouts, reusable controls, low audio latency, safe headphone monitoring, and headless operation. Do not compromise the working Windows version to pursue the hardware prototype.
+
+See **[MicStation hardware roadmap](docs/MICSTATION_ROADMAP.md)** for phased implementation, hardware considerations, success criteria and risks.
+
 ## Quick start (Windows)
 
 1. Plug in **wired headphones** and lower Windows volume to a safe level. **Do not monitor through speakers**. Disable Windows **Listen to this device** and direct/hardware microphone monitoring if they produce an echo.
