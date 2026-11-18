@@ -4,6 +4,8 @@
 
 ![Retro Auto-Tune GUI preview](assets/gui_preview.png)
 
+> **v4.4 — MAX CHAOS, MP3 recording, responsive UI and adjustable vocal following:** Click **★ MAX CHAOS** to turn on Extreme tuning, WALL harmonies, huge reverb, full drums/bass/guitar and tight voice-following together. Click again to restore the settings you had before; **headphone volume is never increased by this button**. Click **● RECORD MP3** while live, choose a destination, and click **■ STOP RECORDING** to finalize a 192 kb/s MP3 of the **entire processed headphone mix** (not raw mic), including band, choir and reverb. The included `imageio-ffmpeg` package provides the encoder, which runs on a worker thread to avoid blocking real-time audio. The window now reflows between three, two, and one control columns as you resize it, with vertical scrolling for smaller displays. The **VOICE FOLLOW INTENSITY** slider controls how often bass and guitar reconsider chords: 0–0.29 every two bars, 0.30–0.64 every bar (v4.3-style), 0.65–0.89 every two beats, and 0.90–1.00 each beat. Drums remain tempo-locked; higher values also increase voice-responsive dynamics. The **FOLLOW MY VOICE** button still turns adaptive accompaniment on or off entirely. Keep your Windows headphone volume moderate!
+
 > **v4.3 — Voice-following backing band:** Add an original synthetic strummed guitar, and turn on **FOLLOW MY VOICE / ADAPT CHORDS** to have the guitar and bass harmonize with stable melody-derived chords while the drum groove reacts to vocal dynamics. Chords change **on bar boundaries** to avoid jittery per-note backing. Click **GUITAR** and **FOLLOW MY VOICE** to enable/disable them independently. With Follow off, the old fixed four-chord progression remains. The display shows the current backing chord. Singing controls chords, *not the BPM*.
 
 > **v4.2:** Bigger backing vocals! The **WALL** preset adds eight synthetic backing singers: upper/lower harmonies, octave layers and slightly detuned doubles, with small timing offsets and stereo spread. **CHOIR** now has four voices; **DUO** keeps one. Harmony Level goes to 150%. In the GUI select WALL and set Harmony Level around 0.85–1.2 (start with a low headphone volume).
@@ -17,7 +19,7 @@
 3. Download this repository (Code → Download ZIP), extract it, and double-click **`INSTALL.bat`** once. Or run `py -m pip install -r requirements.txt`.
 4. Double-click **`START_GUI.bat`** (or run `py retro_autotune_gui.py`).
 5. Select a microphone and your *physically connected headphones* in the audio routing panel, check the headphone safety confirmation, and press **START LIVE**.
-6. Adjust effects while singing. Press **STOP** before unplugging the headphones.
+6. Adjust effects while singing, try **MAX CHAOS**, then press **RECORD MP3** to choose a file and capture your performance. Press **STOP RECORDING** to finish writing the MP3. Press **STOP** before unplugging the headphones.
 
 **Audio interface:** The GUI defaults to **mono output** because it is the most broadly compatible. For spatial stereo reverb, tick Stereo while stopped, provided your output device supports it. The display shows each device's **Windows host API**, such as MME, Windows DirectSound, and Windows WASAPI.
 
@@ -28,8 +30,10 @@
 - **Backing vocals:** Add synth-like harmonizing voice parts (duo / choir / WALL) following your sung notes.
 - **Reverb:** Cher-inspired late-'90s/2000s stereo pop plate, slapback echoes, and smooth tails.
 - **Drums, bass & guitar:** Original synthesized instruments. The optional guitar strums chords; the bass plays roots and fifths; the drummer stays on a steady tempo with dynamically accented hits.
-- **Vocal-following mode:** Uses confidently detected sung notes (rather than raw mic noise) to choose a compatible diatonic chord at each bar. The accompaniment follows your melodic direction but does not attempt complex full-song chord recognition or infer the tempo from your singing. Disable to use the original fixed four-chord backing.
-- **Visual studio:** Waveform oscilloscope, spectrum analyzer, tuning note, mic/output meters, and beat indicator. GUI visuals run outside the audio callback.
+- **Adjustable vocal-following:** Uses confidently detected sung notes to choose compatible diatonic chords on the beat grid. The slider makes chord changes slower or faster (two bars to one beat), with a little hysteresis so sustained common chord tones do not create constant jitter. The band follows your melody without trying to infer BPM. Disable FOLLOW MY VOICE for the fixed four-chord progression.
+- **MAX CHAOS:** Reversible one-click full effects preset. It does not raise headphone monitoring volume.
+- **MP3 performance recording:** Start and stop recording in the live GUI; export 192 kb/s mono/stereo MP3 of the processed headphone mix using a separate encoder thread. The output folder is selected with the Save dialog.
+- **Resolution-aware visual studio:** Scrollable interface with control-panel reflow for smaller screens, plus waveform, spectrum analyzer, pitch display, mic/output meters, and beat indicator. GUI visuals run outside the audio callback.
 
 These are *synthetic effects*, not reproductions of copyrighted recordings or professionally tuned studio algorithms. The octave shifter deliberately has a gritty sound and some pitch imprecision; actual Windows hardware can introduce audible latency.
 
@@ -50,11 +54,11 @@ Earlier builds assumed microphone and headphones could be opened together as one
 
 ## Command-line mode
 
-The console version is retained. It supports `--guitar`, `--follow-voice` and `--guitar-level` (0–1). Press **G** to toggle guitar and **F** to switch between fixed and vocal-following arrangements in the console. The GUI defaults both switches to ON:
+The console version is retained. It supports `--guitar`, `--follow-voice`, `--follow-strength` and `--guitar-level` (0–1). Press **G** to toggle guitar and **F** to switch between fixed and vocal-following arrangements in the console. The GUI defaults both switches to ON:
 
 ```powershell
 py retro_autotune.py --list
-py retro_autotune.py --input 1 --output 5 --headphones --key C --scale minor --preset extreme --reverb cher --backing-vocals wall --harmony-level 1.1 --drums --bass --guitar --follow-voice --guitar-level 0.42 --bpm 110 --groove dance
+py retro_autotune.py --input 1 --output 5 --headphones --key C --scale minor --preset extreme --reverb cher --backing-vocals wall --harmony-level 1.1 --drums --bass --guitar --follow-voice --guitar-level 0.42 --follow-strength 0.85 --bpm 110 --groove dance
 ```
 
 Replace the example numeric device IDs with those reported on your computer. The automatic split-API fallback is in the **GUI (v4.1)**; the console engine continues to use its original single-stream implementation.
@@ -65,14 +69,14 @@ Run the audio-engine self-test and GUI/routing/band tests without connecting a m
 
 ```powershell
 py retro_autotune.py --selftest
-py -m unittest test_gui -v
+py -m unittest test_gui test_features -v
 ```
 
 The new routing tests simulate incompatible Windows host API pairs and a PortAudio `-9993` failure. They do not prove how any particular microphone/headphone driver will behave; real-time listening is the final test.
 
 ## Dependencies & project structure
 
-Python, `numpy`, `sounddevice`, and Tkinter (typically included with Windows Python). `INSTALL.bat` installs the Python packages. No external audio files or cloud services are required.
+Python, `numpy`, `sounddevice`, `imageio-ffmpeg`, and Tkinter (typically included with Windows Python). `INSTALL.bat` installs the Python packages. No external audio files or cloud services are required. MP3 encoding ships through the `imageio-ffmpeg` Python wheel; no manual FFmpeg setup is necessary on supported Windows systems. On unsupported platforms/architectures, encoding may require a working compatible FFmpeg binary.
 
 - `retro_autotune_gui.py`: desktop UI + live audio worker, including split-stream compatibility
 - `retro_autotune.py`: pitch processing, effects, singing-responsive bass, synthesised guitar, tempo-locked drums, and console mode

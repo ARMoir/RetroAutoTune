@@ -6,3 +6,6 @@ venv/
 .pytest_cache/
 .DS_Store
 Thumbs.db
+# Performance recordings are personal; do not accidentally commit them
+*.mp3
+recordings/

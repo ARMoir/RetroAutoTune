@@ -367,13 +367,14 @@ class BackingBand:
     """Steady tempo, vocal-responsive drums, harmonic bass and plucked guitar.
 
     When follow_voice is enabled, the singer's recent pitch-class histogram is
-    evaluated *only at bar boundaries*. Notes are weighted towards diatonic
-    chords; silence retains the previous chord. No per-syllable chord jumping.
+    evaluated on tempo subdivisions chosen by follow_strength. Notes are
+    weighted towards diatonic chords; silence retains the previous chord.
+    Even the fastest mode changes on the beat grid, never per syllable.
     """
 
     def __init__(self, key="C", scale="minor", bpm=110, groove="pop",
                  drums_enabled=False, bass_enabled=False, guitar_enabled=False,
-                 follow_voice=False, drum_level=0.42, bass_level=0.42,
+                 follow_voice=False, follow_strength=0.50, drum_level=0.42, bass_level=0.42,
                  guitar_level=0.42, band_level=0.75):
         self.bpm = int(bpm)
         self.groove = groove
@@ -381,6 +382,7 @@ class BackingBand:
         self.bass_enabled = bool(bass_enabled)
         self.guitar_enabled = bool(guitar_enabled)
         self.follow_voice = bool(follow_voice)
+        self.follow_strength = float(np.clip(follow_strength, 0.0, 1.0))
         self.drum_level = float(drum_level)
         self.bass_level = float(bass_level)
         self.guitar_level = float(guitar_level)
@@ -401,6 +403,7 @@ class BackingBand:
         self.voiced_updates = 0
         self.chord_degree = 0
         self.chord_name = "--"
+        self.last_chord_step = -16
         self.set_key_scale(key, scale)
 
     def set_key_scale(self, key, scale):
@@ -433,6 +436,7 @@ class BackingBand:
         self.pitch_evidence.fill(0.0)
         self.voiced_updates = 0
         self.chord_degree = 0
+        self.last_chord_step = -16
         self.chord_name = NOTE_NAMES[(self.root + intervals[0]) % 12]
         # Avoid leaving old-key chord samples ringing on a scale/key change.
         self.guitar.active.clear()
@@ -454,7 +458,8 @@ class BackingBand:
         self.voice_energy += (0.16 if energy > old else 0.045) * (energy - old)
         self.voice_onset = max(self.voice_onset * 0.91, max(0.0, energy - old))
         if self.follow_voice:
-            self.pitch_evidence *= 0.996
+            # Higher follow strength emphasizes recent sung notes more strongly.
+            self.pitch_evidence *= 0.997 - 0.010 * self.follow_strength
             if voiced:
                 self.pitch_evidence[int(round(note)) % 12] += (0.2 + energy)
                 self.voiced_updates += 1
@@ -465,7 +470,9 @@ class BackingBand:
                                                (target - self.root - self.degree_intervals[i]) % 12))
 
     def _choose_adaptive_chord(self):
-        if self.voiced_updates < 10 or self.pitch_evidence.max() < 1.0:
+        strength = self.follow_strength
+        minimum_updates = 10 if strength < 0.66 else (6 if strength < 0.9 else 4)
+        if self.voiced_updates < minimum_updates or self.pitch_evidence.max() < 0.45:
             return  # Hold through rests and avoid following a stray syllable.
         evidence = self.pitch_evidence
         scores = []
@@ -475,13 +482,25 @@ class BackingBand:
             value = sum(evidence[pc] for pc in chord)
             value += 0.13 * evidence[chord[0]]
             if degree == self.chord_degree:
-                value += 0.16 * float(np.sum(evidence))
+                # Strong follows make it easier for new melody notes to move
+                # the harmony, but still prevent flutter around chord tones.
+                value += (0.20 - 0.14 * strength) * float(np.sum(evidence))
             scores.append(value)
         chosen = int(np.argmax(scores))
         self.chord_degree = chosen
         self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[chosen]) % 12]
-        self.pitch_evidence *= 0.30  # Old notes have less weight in next bar.
+        self.pitch_evidence *= 0.22 if strength >= 0.66 else 0.35
         self.voiced_updates = 0
+
+    def follow_step_interval(self):
+        """Chord reevaluation cadence in sixteenth notes (tempo stays fixed)."""
+        if self.follow_strength >= 0.90:
+            return 4   # quarter note; strong, beat-quantized follow
+        if self.follow_strength >= 0.65:
+            return 8   # every two beats
+        if self.follow_strength >= 0.30:
+            return 16  # each bar, as in v4.3
+        return 32      # every two bars, laid-back support
 
     def bass_midi(self, bar_index, bar_step):
         if self.follow_voice:
@@ -498,10 +517,10 @@ class BackingBand:
 
     def _schedule_step(self, step, offset, drum_events, bass_events, guitar_events):
         pos, bar = step % 16, step // 16
-        if pos == 0:
-            if self.follow_voice:
+        if self.follow_voice:
+            if step % self.follow_step_interval() == 0:
                 self._choose_adaptive_chord()
-            else:
+        elif pos == 0:
                 self.chord_degree = self._degree_from_root_interval(self.chords[bar % len(self.chords)])
                 self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[self.chord_degree]) % 12]
         if self.groove == "dance":
@@ -543,7 +562,8 @@ class BackingBand:
         self.guitar_fade += 0.18 * (float(self.guitar_enabled) - self.guitar_fade)
         # Dynamics follow the singer, while tempo stays steady. This ensures
         # soft phrases do not trigger jittery tempo/chord changes.
-        dynamics = self.voice_energy if self.follow_voice else 0.0
+        dynamics = self.voice_energy * (0.45 + 1.35 * self.follow_strength) if self.follow_voice else 0.0
+        dynamics = min(1.0, dynamics)
         drum_gain = 0.77 + 0.26 * dynamics
         bass_gain = 0.82 + 0.25 * dynamics
         guitar_gain = 0.75 + 0.36 * dynamics
@@ -576,7 +596,7 @@ class VoiceEffects:
                  retune=1.0, mono_output=False, backing_vocals="off",
                  harmony_level=0.55, drums=False, bass=False, guitar=False, follow_voice=False, bpm=110,
                  groove="pop", band_level=0.75, drum_level=0.42, bass_level=0.42,
-                 guitar_level=0.42, voice_octave=0):
+                 guitar_level=0.42, voice_octave=0, follow_strength=0.50):
         if voice_octave not in (-1, 0, 1):
             raise ValueError("voice_octave must be -1, 0, or +1")
         self.voice_octave = int(voice_octave)
@@ -594,7 +614,7 @@ class VoiceEffects:
         self.harmony_level = float(harmony_level)
         self.band = BackingBand(key=key, scale=scale, bpm=bpm, groove=groove,
                                 drums_enabled=drums, bass_enabled=bass, guitar_enabled=guitar,
-                                follow_voice=follow_voice, band_level=band_level,
+                                follow_voice=follow_voice, follow_strength=follow_strength, band_level=band_level,
                                 drum_level=drum_level, bass_level=bass_level,
                                 guitar_level=guitar_level)
         self.music_duck = 1.0
@@ -878,6 +898,7 @@ def run(args):
         mono_output=not args.stereo, backing_vocals=args.backing_vocals,
         harmony_level=args.harmony_level, drums=args.drums, bass=args.bass,
         guitar=args.guitar, follow_voice=args.follow_voice,
+        follow_strength=args.follow_strength,
         bpm=args.bpm, groove=args.groove, band_level=args.band_level,
         drum_level=args.drum_level, bass_level=args.bass_level,
         guitar_level=args.guitar_level,
@@ -1023,6 +1044,8 @@ def main():
     parser.add_argument("--bass", action="store_true", help="Start with synthesized bass enabled")
     parser.add_argument("--guitar", action="store_true", help="Start with synthesized strummed guitar enabled")
     parser.add_argument("--follow-voice", action="store_true", help="Singer selects chords on bar boundaries and affects band dynamics")
+    parser.add_argument("--follow-strength", type=float, default=0.50,
+                        help="Singer-follow intensity 0.0..1.0: from laid-back 2-bar to beat-level chord updates")
     parser.add_argument("--bpm", type=int, default=110, help="Tempo for drums and bass (60..180)")
     parser.add_argument("--groove", choices=("pop", "dance", "half-time"), default="pop")
     parser.add_argument("--band-level", type=float, default=0.75, help="Backing band master volume, 0..1")
@@ -1044,6 +1067,8 @@ def main():
         parser.error("Choose at most one of --stereo and --mono-output")
     if not 60 <= args.bpm <= 180:
         parser.error("--bpm must be 60..180")
+    if not 0.0 <= args.follow_strength <= 1.0:
+        parser.error("--follow-strength must be 0..1")
     for name in ("band_level", "drum_level", "bass_level", "guitar_level"):
         if not 0.0 <= getattr(args, name) <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be 0..1")

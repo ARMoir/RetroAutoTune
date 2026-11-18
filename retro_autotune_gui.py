@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neon live studio interface for the Retro Auto-Tune v4.3 audio engine.
+"""Neon live studio interface for the Retro Auto-Tune v4.4 audio engine.
 
 Tkinter only for controls/visuals, NumPy and sounddevice for audio.
 No Tk functions run on the PortAudio callback thread. Use wired headphones.
@@ -7,18 +7,21 @@ No Tk functions run on the PortAudio callback thread. Use wired headphones.
 from __future__ import annotations
 
 import math
+from datetime import datetime
+from pathlib import Path
 import queue
 import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 
 from retro_autotune import (
     HOP, SAMPLE_RATE, KEYS, SCALES, VoiceEffects, allowed_notes
 )
+from mp3_recorder import Mp3Recorder
 
 BG = "#090d19"
 PANEL = "#151d30"
@@ -49,6 +52,8 @@ class AudioWorker:
         self.overloads = 0
         self.volume = float(config["volume"])
         self.history = np.zeros(2048, dtype=np.float32)
+        self.recorder = None
+        self.record_starting = False
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True, name="AutoTune-Audio")
@@ -56,6 +61,38 @@ class AudioWorker:
 
     def stop(self):
         self.stop_event.set()
+        self.stop_recording()
+
+    def start_recording(self, destination):
+        """Launch MP3 encoder off the real-time audio processing thread."""
+        if self.stop_event.is_set() or self.recorder is not None or self.record_starting:
+            return False
+        self.record_starting = True
+
+        def prepare():
+            try:
+                recorder = Mp3Recorder(destination,
+                                       2 if self.config["stereo"] else 1,
+                                       self.events, sample_rate=SAMPLE_RATE)
+                recorder.start()
+                if self.stop_event.is_set():
+                    recorder.stop()
+                else:
+                    self.recorder = recorder
+                    self.events.put(("recording_started", str(destination)))
+            except Exception:
+                self.events.put(("record_error", traceback.format_exc()))
+            finally:
+                self.record_starting = False
+
+        threading.Thread(target=prepare, name="AutoTune-MP3-Setup", daemon=True).start()
+        return True
+
+    def stop_recording(self):
+        recorder, self.recorder = self.recorder, None
+        if recorder is not None:
+            recorder.stop()
+            self.events.put(("record_stopping", "Finishing MP3…"))
 
     def command(self, name, value):
         self.commands.put((name, value))
@@ -81,8 +118,16 @@ class AudioWorker:
             fx.band.guitar_enabled = bool(value)
         elif name == "follow_voice":
             fx.band.follow_voice = bool(value)
+        elif name == "follow_strength":
+            fx.band.follow_strength = float(np.clip(value, 0.0, 1.0))
         elif name == "guitar_level":
             fx.band.guitar_level = float(value)
+        elif name == "drum_level":
+            fx.band.drum_level = float(value)
+        elif name == "bass_level":
+            fx.band.bass_level = float(value)
+        elif name == "band_level":
+            fx.band.band_level = float(value)
         elif name == "bpm":
             fx.band.set_bpm(value)
         elif name == "groove":
@@ -138,7 +183,11 @@ class AudioWorker:
                 backing_vocals=c["harmony"], harmony_level=c["harmony_level"],
                 drums=c["drums"], bass=c["bass"], guitar=c.get("guitar", False),
                 follow_voice=c.get("follow_voice", False),
+                follow_strength=c.get("follow_strength", 0.50),
                 guitar_level=c.get("guitar_level", 0.42), bpm=c["bpm"],
+                bass_level=c.get("bass_level", 0.42),
+                drum_level=c.get("drum_level", 0.42),
+                band_level=c.get("band_level", 0.75),
                 groove=c["groove"], voice_octave=c["voice_octave"],
             )
 
@@ -167,6 +216,9 @@ class AudioWorker:
                             self.apply_command(fx, name, value)
                     processed = fx.process(indata[:, 0])
                     outdata[:] = processed * self.volume
+                    recorder = self.recorder
+                    if recorder is not None:
+                        recorder.feed(outdata)
                     self.history[:-HOP] = self.history[HOP:]
                     self.history[-HOP:] = outdata[:, 0]
                     self.callback_count += 1
@@ -178,6 +230,7 @@ class AudioWorker:
                             "note": fx.last_note if fx.gate_level > 0.10 else "--",
                             "chord": fx.band.chord_name,
                             "follow_voice": fx.band.follow_voice,
+                            "follow_strength": fx.band.follow_strength,
                             "confidence": fx.last_confidence if fx.gate_level > 0.10 else 0.0,
                             "beat": fx.band.step_index // 4 % 4,
                             "step": fx.band.step_index,
@@ -270,6 +323,7 @@ class AudioWorker:
         except Exception:
             self.events.put(("error", traceback.format_exc()))
         finally:
+            self.stop_recording()
             self.running = False
             self.events.put(("stopped", "Audio monitoring stopped"))
 
@@ -279,8 +333,9 @@ class StudioApp:
         self.root = root
         root.title("RETRO / TUNE 2008 — LIVE STUDIO")
         root.configure(bg=BG)
-        root.geometry("1140x850")
-        root.minsize(900, 650)
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(1140, max(620, screen_w-90))}x{min(850, max(480, screen_h-120))}")
+        root.minsize(620, 480)
         self.worker = None
         self.closing = False
         self.last_snapshot = None
@@ -303,7 +358,11 @@ class StudioApp:
         self.bass_var = tk.BooleanVar(value=True)
         self.guitar_var = tk.BooleanVar(value=True)
         self.follow_voice_var = tk.BooleanVar(value=True)
+        self.follow_strength_var = tk.DoubleVar(value=0.50)
         self.guitar_level_var = tk.DoubleVar(value=0.42)
+        self.drum_level_var = tk.DoubleVar(value=0.42)
+        self.bass_level_var = tk.DoubleVar(value=0.42)
+        self.band_level_var = tk.DoubleVar(value=0.75)
         self.groove_var = tk.StringVar(value="dance")
         self.octave_var = tk.IntVar(value=0)
         self.bpm_var = tk.IntVar(value=110)
@@ -312,9 +371,17 @@ class StudioApp:
         self.volume_var = tk.DoubleVar(value=0.55)
         self.octave_mix_var = tk.DoubleVar(value=0.20)
         self.gain_var = tk.DoubleVar(value=1.0)
+        self.chaos_enabled = False
+        self.before_chaos = None
+        self.recording = False
+        self.record_filename = ""
+        self._event_queues = []
+        self._layout_mode = None
         self._setup_styles()
         self._build()
         self.refresh_devices()
+        root.bind("<Configure>", self._resize_layout)
+        root.after(120, lambda: self._resize_layout())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(40, self._poll)
 
@@ -385,13 +452,16 @@ class StudioApp:
         devices = self._panel(body, "01   Audio routing & safety")
         devices.pack(fill="x", padx=18, pady=(0, 12))
         device_row = tk.Frame(devices, bg=PANEL)
+        self.device_row = device_row
         device_row.pack(fill="x", padx=16, pady=5)
         input_col = tk.Frame(device_row, bg=PANEL)
+        self.input_col = input_col
         input_col.pack(side="left", fill="x", expand=True, padx=(0, 9))
         self._label(input_col, "MICROPHONE", size=9).pack(anchor="w")
         self.input_combo = self._combo(input_col, self.input_var, [], width=35)
         self.input_combo.pack(fill="x", pady=4)
         output_col = tk.Frame(device_row, bg=PANEL)
+        self.output_col = output_col
         output_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self._label(output_col, "HEADPHONE OUTPUT (NOT SPEAKERS)", size=9).pack(anchor="w")
         self.output_combo = self._combo(output_col, self.output_var, [], width=35)
@@ -415,17 +485,28 @@ class StudioApp:
 
         transport = tk.Frame(body, bg=BG)
         transport.pack(fill="x", padx=18, pady=(0, 12))
-        self.start_btn = self._button(transport, "▶  START LIVE", self.start_audio, active=True, accent=LIME)
+        action_row = tk.Frame(transport, bg=BG)
+        action_row.pack(fill="x")
+        self.start_btn = self._button(action_row, "▶  START LIVE", self.start_audio, active=True, accent=LIME)
         self.start_btn.pack(side="left")
-        self.stop_btn = self._button(transport, "■  STOP", self.stop_audio)
+        self.stop_btn = self._button(action_row, "■  STOP", self.stop_audio)
         self.stop_btn.configure(state="disabled")
         self.stop_btn.pack(side="left", padx=8)
-        self.status_label = self._label(transport, "", MUTED, 11, True, textvariable=self.status_var)
-        self.status_label.pack(side="left", padx=14)
+        self.record_btn = self._button(action_row, "●  RECORD MP3", self.toggle_recording, accent=RED)
+        self.record_btn.configure(state="disabled")
+        self.record_btn.pack(side="left", padx=3)
+        self.chaos_btn = self._button(action_row, "★  MAX CHAOS", self.toggle_chaos, accent=PINK)
+        self.chaos_btn.pack(side="left", padx=8)
+        self.status_label = self._label(transport, "", MUTED, 10, True,
+                                       textvariable=self.status_var, anchor="w", justify="left")
+        self.status_label.pack(fill="x", pady=(7, 0))
+        self.transport = transport
 
         vizrow = tk.Frame(body, bg=BG)
+        self.vizrow = vizrow
         vizrow.pack(fill="x", padx=18, pady=(0, 12))
         wave_panel = self._panel(vizrow, "Live vocal waveform  /  tuned output")
+        self.wave_panel = wave_panel
         wave_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.wave_canvas = tk.Canvas(wave_panel, bg=INNER, height=184, highlightthickness=0)
         self.wave_canvas.pack(fill="x", padx=14, pady=(8, 14))
@@ -433,6 +514,7 @@ class StudioApp:
         self.wave_line = self.wave_canvas.create_line(0, 92, 800, 92, fill=CYAN, width=2,
                                                        smooth=True)
         pitch_panel = self._panel(vizrow, "Pitch lock  /  detected note")
+        self.pitch_panel = pitch_panel
         pitch_panel.configure(width=262)
         pitch_panel.pack(side="right", fill="y")
         pitch_panel.pack_propagate(False)
@@ -444,8 +526,10 @@ class StudioApp:
         tk.Frame(pitch_panel, bg=PANEL, height=5).pack(pady=5)
 
         meters = tk.Frame(body, bg=BG)
+        self.meters_row = meters
         meters.pack(fill="x", padx=18, pady=(0, 12))
         spec_panel = self._panel(meters, "Audio spectrum  /  50 Hz – 8 kHz")
+        self.spec_panel = spec_panel
         spec_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
         self.spectrum_canvas = tk.Canvas(spec_panel, bg=INNER, height=155, highlightthickness=0)
         self.spectrum_canvas.pack(fill="x", padx=14, pady=(8, 14))
@@ -454,6 +538,7 @@ class StudioApp:
             r = self.spectrum_canvas.create_rectangle(0, 155, 1, 154, outline="", fill=CYAN)
             self.spectrum_bars.append(r)
         beat_panel = self._panel(meters, "Levels  /  rhythm")
+        self.beat_panel = beat_panel
         beat_panel.configure(width=262)
         beat_panel.pack(side="right", fill="y")
         beat_panel.pack_propagate(False)
@@ -474,11 +559,13 @@ class StudioApp:
             b.pack(side="left", padx=4)
 
         ctrls = tk.Frame(body, bg=BG)
+        self.ctrls = ctrls
         ctrls.pack(fill="x", padx=18, pady=(0, 16))
         ctrls.grid_columnconfigure(0, weight=1, uniform="ctrl")
         ctrls.grid_columnconfigure(1, weight=1, uniform="ctrl")
         ctrls.grid_columnconfigure(2, weight=1, uniform="ctrl")
         pitch = self._panel(ctrls, "02   Pitch & lead voice")
+        self.pitch_controls = pitch
         pitch.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
         scale_row = tk.Frame(pitch, bg=PANEL)
         scale_row.pack(fill="x", padx=14, pady=8)
@@ -507,6 +594,7 @@ class StudioApp:
                      lambda v: self._send("octave_mix", round(float(v), 2)))
 
         vocal = self._panel(ctrls, "03   Backing vocals & space")
+        self.vocal_controls = vocal
         vocal.grid(row=0, column=1, sticky="nsew", padx=7)
         self._label(vocal, "HARMONY VOICES", size=9).pack(anchor="w", padx=14, pady=(8, 0))
         hr = tk.Frame(vocal, bg=PANEL)
@@ -527,6 +615,7 @@ class StudioApp:
                      lambda v: self._send("volume", round(float(v), 2)))
 
         band = self._panel(ctrls, "04   Voice-following backing band")
+        self.band_controls = band
         band.grid(row=0, column=2, sticky="nsew", padx=(7, 0))
         instruments = tk.Frame(band, bg=PANEL)
         instruments.pack(fill="x", padx=14, pady=(8, 12))
@@ -538,8 +627,14 @@ class StudioApp:
         self.guitar_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
         self.follow_btn = self._button(band, "FOLLOW MY VOICE / ADAPT CHORDS", self._toggle_follow_voice)
         self.follow_btn.pack(fill="x", padx=14, pady=(0, 8))
+        self._slider(band, "VOICE FOLLOW INTENSITY  /  RELAXED → TIGHT", self.follow_strength_var,
+                     0.0, 1.0, lambda v: self._send("follow_strength", round(float(v), 2)))
         self._slider(band, "GUITAR LEVEL", self.guitar_level_var, 0.0, 1.0,
                      lambda v: self._send("guitar_level", round(float(v), 2)))
+        self._slider(band, "BASS LEVEL", self.bass_level_var, 0.0, 1.0,
+                     lambda v: self._send("bass_level", round(float(v), 2)))
+        self._slider(band, "DRUM LEVEL", self.drum_level_var, 0.0, 1.0,
+                     lambda v: self._send("drum_level", round(float(v), 2)))
         self._label(band, "GROOVE", size=9).pack(anchor="w", padx=14)
         self._combo(band, self.groove_var, ("pop", "dance", "half-time"),
                     callback=lambda: self._send("groove", self.groove_var.get())).pack(fill="x", padx=14, pady=6)
@@ -552,7 +647,7 @@ class StudioApp:
         self._button(bpmrow, "+ 5", lambda: self._set_bpm(self.bpm_var.get()+5)).pack(side="right")
         self._label(band, "Tempo-locked drums · vocal-guided bass & guitar chords", MUTED, 9).pack(anchor="w", padx=14, pady=12)
 
-        self._label(body, "v4.3 GUI  ·  adaptive backing band  ·  wired headphones recommended  ·  no acoustic feedback cancellation",
+        self._label(body, "v4.4  ·  Max Chaos, MP3 recording & tighter voice-follow  ·  wired headphones only",
                     MUTED, 9).pack(padx=18, pady=(0, 24))
         self._sync_controls()
         self._wave_grid()
@@ -570,6 +665,102 @@ class StudioApp:
                  resolution=0.01, orient="horizontal", showvalue=False,
                  bg=PANEL, fg=WHITE, troughcolor=INNER, activebackground=CYAN,
                  highlightthickness=0, bd=0, sliderlength=18).pack(fill="x", padx=14)
+
+    def _resize_layout(self, event=None):
+        """Switch three/two/one control columns to fit available window width."""
+        if event is not None and event.widget is not self.root:
+            return
+        width = self.root.winfo_width()
+        columns = 3 if width >= 1080 else (2 if width >= 760 else 1)
+        stacked = width < 830
+        mode = (columns, stacked)
+        if mode == self._layout_mode:
+            return
+        self._layout_mode = mode
+        for i in range(3):
+            self.ctrls.grid_columnconfigure(i, weight=1 if i < columns else 0,
+                                            uniform="ctrl" if i < columns else "")
+        for widget in (self.pitch_controls, self.vocal_controls, self.band_controls):
+            widget.grid_forget()
+        for i, widget in enumerate((self.pitch_controls, self.vocal_controls, self.band_controls)):
+            row, column = divmod(i, columns)
+            span = 2 if columns == 2 and i == 2 else 1
+            widget.grid(row=row, column=column, columnspan=span,
+                        sticky="nsew", padx=5, pady=(0, 10))
+
+        self.input_col.pack_forget()
+        self.output_col.pack_forget()
+        if stacked:
+            self.input_col.pack(side="top", fill="x", expand=True, padx=0)
+            self.output_col.pack(side="top", fill="x", expand=True, padx=0)
+        else:
+            self.input_col.pack(side="left", fill="x", expand=True, padx=(0, 9))
+            self.output_col.pack(side="left", fill="x", expand=True, padx=(9, 0))
+
+        for first, second, fixed_height in ((self.wave_panel, self.pitch_panel, 214),
+                                            (self.spec_panel, self.beat_panel, 214)):
+            first.pack_forget()
+            second.pack_forget()
+            if stacked:
+                first.pack(side="top", fill="x", pady=(0, 9))
+                second.configure(width=260, height=fixed_height)
+                second.pack(side="top", fill="x")
+            else:
+                first.pack(side="left", fill="both", expand=True, padx=(0, 10))
+                second.configure(width=262, height=fixed_height)
+                second.pack(side="right", fill="y")
+        self._wave_grid()
+
+    def toggle_chaos(self):
+        """One-button maximal effects, reversible without changing headphone volume."""
+        bindings = {
+            "preset": (self.preset_var, "extreme"),
+            "reverb": (self.reverb_var, True),
+            "reverb_mix": (self.reverb_mix_var, 0.72),
+            "harmony": (self.harmony_var, "wall"),
+            "harmony_level": (self.harmony_level_var, 1.35),
+            "drums": (self.drums_var, True),
+            "bass": (self.bass_var, True),
+            "guitar": (self.guitar_var, True),
+            "follow_voice": (self.follow_voice_var, True),
+            "follow_strength": (self.follow_strength_var, 1.00),
+            "guitar_level": (self.guitar_level_var, 0.90),
+            "bass_level": (self.bass_level_var, 0.78),
+            "drum_level": (self.drum_level_var, 0.75),
+            "band_level": (self.band_level_var, 0.90),
+            "octave_mix": (self.octave_mix_var, 0.50),
+            "groove": (self.groove_var, "dance"),
+        }
+        if not self.chaos_enabled:
+            self.before_chaos = {name: var.get() for name, (var, _) in bindings.items()}
+            settings = {name: new for name, (_, new) in bindings.items()}
+            self.chaos_enabled = True
+        else:
+            settings = self.before_chaos or {}
+            self.before_chaos = None
+            self.chaos_enabled = False
+        for name, value in settings.items():
+            var = bindings[name][0]
+            var.set(value)
+            self._send(name, value)
+        self._sync_controls()
+
+    def toggle_recording(self):
+        if self.worker is None or not self.worker.running:
+            return
+        if self.worker.recorder is not None:
+            self.worker.stop_recording()
+            self.recording = False
+            self.record_btn.configure(text="●  RECORD MP3", bg=INNER, fg=WHITE)
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self.root, title="Record the complete Auto-Tune mix as MP3",
+            defaultextension=".mp3", filetypes=[("MP3 audio", "*.mp3")],
+            initialfile=f"RetroAutoTune_{datetime.now():%Y%m%d_%H%M%S}.mp3",
+            initialdir=str(Path.home() / "Music") if (Path.home() / "Music").is_dir() else str(Path.home()))
+        if destination and self.worker.start_recording(destination):
+            self.record_filename = destination
+            self.record_btn.configure(state="disabled", text="Preparing MP3…")
 
     def _wave_grid(self):
         canvas = getattr(self, "wave_canvas", None)
@@ -679,6 +870,8 @@ class StudioApp:
             self._update_button(btn, self.harmony_var.get() == mode, CYAN)
         for octave, btn in self.octave_buttons.items():
             self._update_button(btn, self.octave_var.get() == octave, ORANGE)
+        self._update_button(self.chaos_btn, self.chaos_enabled, PINK)
+        self.chaos_btn.configure(text="★  MAX CHAOS ON" if self.chaos_enabled else "★  MAX CHAOS")
 
     def start_audio(self):
         if self.worker:
@@ -710,11 +903,15 @@ class StudioApp:
             "harmony_level": self.harmony_level_var.get(), "drums": self.drums_var.get(),
             "bass": self.bass_var.get(), "guitar": self.guitar_var.get(),
             "follow_voice": self.follow_voice_var.get(), "guitar_level": self.guitar_level_var.get(),
+            "follow_strength": self.follow_strength_var.get(),
+            "drum_level": self.drum_level_var.get(), "bass_level": self.bass_level_var.get(),
+            "band_level": self.band_level_var.get(),
             "bpm": self.bpm_var.get(), "groove": self.groove_var.get(),
             "voice_octave": self.octave_var.get(), "octave_mix": self.octave_mix_var.get(),
             "gain": self.gain_var.get(), "volume": self.volume_var.get(),
         }
         self.worker = AudioWorker(config)
+        self._event_queues.append(self.worker.events)
         self.worker.start()
         self.status_var.set("STARTING  ·  Connecting audio...")
         self._transport_state(active=True)
@@ -722,6 +919,9 @@ class StudioApp:
     def _transport_state(self, active):
         self.start_btn.configure(state="disabled" if active else "normal")
         self.stop_btn.configure(state="normal" if active else "disabled")
+        if not active:
+            self.record_btn.configure(state="disabled", text="●  RECORD MP3", bg=INNER, fg=WHITE)
+            self.recording = False
         state = "disabled" if active else "readonly"
         self.input_combo.configure(state=state)
         self.output_combo.configure(state=state)
@@ -738,15 +938,34 @@ class StudioApp:
         if self.closing and (self.worker is None or not self.worker.thread.is_alive()):
             self.root.destroy()
             return
-        if self.worker:
+        for messages in self._event_queues:
             while True:
                 try:
-                    kind, info = self.worker.events.get_nowait()
+                    kind, info = messages.get_nowait()
                 except queue.Empty:
                     break
                 if kind in ("starting", "running"):
                     self.status_var.set(info)
                     self.status_label.configure(fg=LIME if kind == "running" else ORANGE)
+                    if kind == "running" and self.worker:
+                        self.record_btn.configure(state="normal")
+                elif kind == "recording_started":
+                    self.recording = True
+                    self.record_btn.configure(text="■  STOP RECORDING", state="normal", bg=RED, fg=BG)
+                    self.status_var.set("RECORDING  ·  " + Path(info).name)
+                elif kind == "record_stopping":
+                    self.recording = False
+                    self.record_btn.configure(text="●  RECORD MP3", state="normal" if self.worker else "disabled",
+                                              bg=INNER, fg=WHITE)
+                    self.status_var.set(info)
+                elif kind == "record_saved":
+                    self.recording = False
+                    self.status_var.set("MP3 saved  ·  " + info)
+                elif kind == "record_error":
+                    self.recording = False
+                    self.record_btn.configure(text="●  RECORD MP3", state="normal" if self.worker else "disabled")
+                    self.status_var.set("MP3 recording error")
+                    messagebox.showerror("MP3 recording error", str(info)[-2200:])
                 elif kind == "error":
                     # Show the actual exception, even when the PortAudio callback aborted.
                     self.status_var.set("ERROR  ·  Audio stream failed")
@@ -756,6 +975,7 @@ class StudioApp:
                 elif kind == "stopped":
                     self.status_var.set(info)
                     self.status_label.configure(fg=MUTED)
+        if self.worker:
             last = None
             while True:
                 try:
