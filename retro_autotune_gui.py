@@ -22,6 +22,9 @@ from retro_autotune import (
     HOP, SAMPLE_RATE, KEYS, SCALES, VoiceEffects, allowed_notes
 )
 from mp3_recorder import Mp3Recorder
+from session_settings import (
+    VERSION as SESSION_VERSION, load_session, save_session, settings_path, device_match, valid_values
+)
 
 BG = "#090d19"
 PANEL = "#151d30"
@@ -336,8 +339,15 @@ class AudioWorker:
 
 
 class StudioApp:
-    def __init__(self, root):
+    def __init__(self, root, settings_file=None):
         self.root = root
+        self.settings_file = settings_file or settings_path()
+        self.saved_session = load_session(self.settings_file)
+        self._save_after_id = None
+        self._restore_in_progress = True
+        saved_devices = self.saved_session.get("devices", {})
+        self.preferred_input = saved_devices.get("input")
+        self.preferred_output = saved_devices.get("output")
         root.title("RETRO / TUNE 2008 — LIVE STUDIO")
         root.configure(bg=BG)
         screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -348,6 +358,8 @@ class StudioApp:
         self.last_snapshot = None
         self.devices_in = {}
         self.devices_out = {}
+        self.device_meta_in = {}
+        self.device_meta_out = {}
         self.status_var = tk.StringVar(value="STOPPED  ·  Select your microphone and headphones")
         self.note_var = tk.StringVar(value="--")
         self.pitch_var = tk.StringVar(value="Sing into the microphone")
@@ -386,13 +398,93 @@ class StudioApp:
         self.record_filename = ""
         self._event_queues = []
         self._layout_mode = None
+        self._restore_saved_values()
         self._setup_styles()
         self._build()
         self.refresh_devices()
+        self._restore_in_progress = False
+        self._watch_settings()
         root.bind("<Configure>", self._resize_layout)
         root.after(120, lambda: self._resize_layout())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(40, self._poll)
+
+    def _setting_vars(self):
+        """All performer controls that should survive app updates and restarts."""
+        return {
+            "stereo": self.stereo_var,
+            "key": self.key_var, "scale": self.scale_var,
+            "preset": self.preset_var, "reverb": self.reverb_var,
+            "reverb_mix": self.reverb_mix_var,
+            "harmony": self.harmony_var, "harmony_level": self.harmony_level_var,
+            "drums": self.drums_var, "bass": self.bass_var,
+            "guitar": self.guitar_var, "follow_voice": self.follow_voice_var,
+            "song_mode": self.song_mode_var,
+            "follow_strength": self.follow_strength_var,
+            "guitar_level": self.guitar_level_var,
+            "bass_level": self.bass_level_var,
+            "drum_level": self.drum_level_var,
+            "band_level": self.band_level_var,
+            "groove": self.groove_var, "voice_octave": self.octave_var,
+            "bpm": self.bpm_var, "octave_mix": self.octave_mix_var,
+            "gain": self.gain_var, "volume": self.volume_var,
+        }
+
+    def _restore_saved_values(self):
+        settings = self.saved_session.get("settings", {})
+        for key, var in self._setting_vars().items():
+            if key in settings:
+                var.set(settings[key])
+        if self.saved_session.get("chaos_enabled") and self.saved_session.get("before_chaos"):
+            self.chaos_enabled = True
+            self.before_chaos = dict(self.saved_session["before_chaos"])
+
+    def _watch_settings(self):
+        for var in self._setting_vars().values():
+            var.trace_add("write", lambda *args: self._schedule_session_save())
+        self.input_var.trace_add("write", lambda *args: self._device_selected("input"))
+        self.output_var.trace_add("write", lambda *args: self._device_selected("output"))
+
+    def _device_selected(self, direction):
+        label = (self.input_var if direction == "input" else self.output_var).get()
+        identities = self.device_meta_in if direction == "input" else self.device_meta_out
+        if label in identities:
+            if direction == "input":
+                self.preferred_input = dict(identities[label])
+            else:
+                self.preferred_output = dict(identities[label])
+        # A disconnected device does not erase the last-used preference.
+        self._schedule_session_save()
+
+    def _session_payload(self):
+        return {
+            "version": SESSION_VERSION,
+            "settings": valid_values({name: var.get() for name, var in self._setting_vars().items()}),
+            "devices": {"input": self.preferred_input, "output": self.preferred_output},
+            "chaos_enabled": self.chaos_enabled,
+            "before_chaos": self.before_chaos or {},
+        }
+
+    def _schedule_session_save(self):
+        if self._restore_in_progress or self.closing:
+            return
+        if self._save_after_id is not None:
+            self.root.after_cancel(self._save_after_id)
+        # Debounce changes from Tk scales. Never write settings in the audio callback.
+        self._save_after_id = self.root.after(500, self._save_session_now)
+
+    def _save_session_now(self):
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+            self._save_after_id = None
+        try:
+            save_session(self._session_payload(), self.settings_file)
+        except (OSError, ValueError) as exc:
+            # Persistence issues must not interrupt a performance.
+            print(f"Warning: could not save RetroAutoTune settings: {exc}")
 
     def _setup_styles(self):
         style = ttk.Style(self.root)
@@ -661,7 +753,7 @@ class StudioApp:
         self._button(bpmrow, "+ 5", lambda: self._set_bpm(self.bpm_var.get()+5)).pack(side="right")
         self._label(band, "Tempo-locked drums · vocal-guided bass & guitar chords", MUTED, 9).pack(anchor="w", padx=14, pady=12)
 
-        self._label(body, "v4.5  ·  Offline Intelligent Song Mode · MAX CHAOS · wired headphones only",
+        self._label(body, "v4.6  ·  Last session autosaved · confirm headphones each launch · Song Mode · MAX CHAOS",
                     MUTED, 9).pack(padx=18, pady=(0, 24))
         self._sync_controls()
         self._wave_grid()
@@ -758,6 +850,7 @@ class StudioApp:
             var.set(value)
             self._send(name, value)
         self._sync_controls()
+        self._schedule_session_save()
 
     def toggle_recording(self):
         if self.worker is None or not self.worker.running:
@@ -791,31 +884,42 @@ class StudioApp:
     def refresh_devices(self):
         if self.worker is not None:
             return
-        current_in, current_out = self.input_var.get(), self.output_var.get()
+        # Preserve identities before changing enumeration, even if audio indices
+        # or label prefixes change following a Windows audio device reconnect.
+        old_in = self.device_meta_in.get(self.input_var.get()) or self.preferred_input
+        old_out = self.device_meta_out.get(self.output_var.get()) or self.preferred_output
         try:
             import sounddevice as sd
             all_devices = sd.query_devices()
             hosts = sd.query_hostapis()
-            self.devices_in, self.devices_out = {}, {}
+            new_in, new_out = {}, {}
+            meta_in, meta_out = {}, {}
+            seen_in, seen_out = {}, {}
             for i, d in enumerate(all_devices):
-                host = hosts[d["hostapi"]]["name"]
-                text = f"{i}: {d['name']}  [{host}]"
+                host = str(hosts[d["hostapi"]]["name"])
+                name = str(d["name"])
+                text = f"{i}: {name}  [{host}]"
+                token = (name, host)
                 if d["max_input_channels"] > 0:
-                    self.devices_in[text] = i
+                    occurrence = seen_in.get(token, 0)
+                    seen_in[token] = occurrence + 1
+                    new_in[text] = i
+                    meta_in[text] = {"name": name, "hostapi": host, "occurrence": occurrence}
                 if d["max_output_channels"] > 0:
-                    self.devices_out[text] = i
-            self.input_combo["values"] = list(self.devices_in)
-            self.output_combo["values"] = list(self.devices_out)
-            if current_in in self.devices_in:
-                self.input_var.set(current_in)
-            else:
-                self.input_var.set("")
-            if current_out in self.devices_out:
-                self.output_var.set(current_out)
-            else:
-                self.output_var.set("")
+                    occurrence = seen_out.get(token, 0)
+                    seen_out[token] = occurrence + 1
+                    new_out[text] = i
+                    meta_out[text] = {"name": name, "hostapi": host, "occurrence": occurrence}
+            self.devices_in, self.devices_out = new_in, new_out
+            self.device_meta_in, self.device_meta_out = meta_in, meta_out
+            self.input_combo["values"] = list(new_in)
+            self.output_combo["values"] = list(new_out)
+            self.input_var.set(device_match(old_in, meta_in))
+            self.output_var.set(device_match(old_out, meta_out))
             if not self.devices_in or not self.devices_out:
                 self.status_var.set("No audio devices detected. Plug in headphones and refresh.")
+            elif not self.input_var.get() or not self.output_var.get():
+                self.status_var.set("Choose your microphone/headphones; a saved device may be disconnected.")
         except Exception as exc:
             self.status_var.set("Audio devices unavailable: " + str(exc))
 
@@ -1072,6 +1176,7 @@ class StudioApp:
             item.configure(bg=LIME if on else INNER, fg=BG if on else MUTED)
 
     def _close(self):
+        self._save_session_now()
         self.closing = True
         if self.worker:
             self.worker.stop()
