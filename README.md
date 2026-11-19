@@ -4,6 +4,17 @@
 
 ![Retro Auto-Tune GUI preview](assets/gui_preview.png)
 
+## v4.8 live audio fix
+
+The neutral lead vocal now passes through the pitch shifter in **13.4 ms**, down from **26.7 ms** at 48 kHz. These figures measure the effect itself. The microphone, headphone driver and selected buffer add to the delay you hear.
+
+- The GUI and CLI spend less time rendering the choir, octave and reverb. Muted reverb goes idle after fading out. Changing the key in the GUI prepares the guitar strums before the audio callback needs them.
+- Intelligent Song Mode skips phrase alignments as soon as they cannot meet its existing match threshold, reducing audio processing spikes after it has learned many melodies.
+- When the GUI opens separate microphone and headphone streams, it adjusts how many mic samples each output block consumes as their clocks drift. It keeps a small reserve for drivers that deliver audio in bursts. The band continues on the headphone clock.
+- A beat that falls on the boundary between audio blocks now plays exactly once. This fixes a missing kick, bass note and strum 12 seconds into the 110 BPM dance groove.
+
+To try it on Windows, extract this version into a fresh folder and launch **`START_GUI.bat`**. Select **Fast** under Audio routing to hear the lowest requested latency. Your saved microphone, headphones and effects carry over. Check the headphone box and press **START LIVE**.
+
 > **v4.6 — Remember last session automatically:** The GUI now saves your current effect settings (including Extreme, reverb, WALL choir, MAX CHAOS state, Song Mode, band levels, voice-follow strength, key/scale, BPM, octave, stereo, gain and monitoring volume), plus the selected **microphone and headphone/output device**. It restores these when you next open the GUI, including after downloading the next release. No Save button is necessary: settings are autosaved after changes and again on exit. Preferences are kept in your **user profile, not the extracted ZIP folder**: on Windows at `%LOCALAPPDATA%\RetroAutoTune\last_session.json`, and on Linux at `~/.config/RetroAutoTune/last_session.json` (or `$XDG_CONFIG_HOME/RetroAutoTune/last_session.json`). Use the normal GUI and press Start Live as before. **Audio never auto-starts**; headphone safety confirmation is deliberately cleared each launch. If a remembered audio device is missing, the selection stays blank instead of routing audio to an unrelated speaker. Press **↻ Devices** after reconnecting it. Device matching uses the device name, host API and duplicate occurrence, not the ephemeral Windows device number. Very similarly named duplicate devices may still require manual verification.
 
 > **v4.5 — Intelligent Song Mode (offline prototype):** The optional **♪ INTELLIGENT SONG MODE** button adds a musical phrase-memory engine. It listens to stable, pitched vocal notes (not the microphone recording), segments phrases on short pauses, matches repeated melodies despite moderate timing variation or transposition, remembers beat-aligned accompaniment chords, and recognizes verse-/chorus-like moments. The band subtly changes guitar, bass and drum intensity at bar boundaries, and brings back remembered chords when a familiar melody returns. The display shows **INTRO**, **VERSE**, **CHORUS**, or **BREAK**, plus phrases/repeats learned. Song Mode starts **OFF** to preserve v4.4's sound; MAX CHAOS stays independent. Everything runs locally without AI, internet, music files, or new pip dependencies. This is a heuristic first version, not full automatic song composition or reliable formal music analysis.
@@ -50,7 +61,7 @@ This maintenance build responds to reports of crackling, delayed beats and inter
 
 ### Recommended Windows troubleshooting steps
 
-1. **Try v4.7 with the same headphones and settings.** With headphones connected, select **Fast** first, begin monitoring and sing for 30–60 seconds with MAX CHAOS. Look at **XRUN**, **late**, **mic gaps**, and **mic drops**. Compare with Song Mode off; if counts still rise it is not solely Song Mode.
+1. With the same headphones and settings, select **Fast**, start monitoring and sing for 30–60 seconds. Watch **XRUN**, **late**, **mic gaps** and **mic drops** while using your usual effects.
 2. If clicking continues, STOP, select **Balanced**, START LIVE again; if needed, retry **Stable**. These profiles can increase latency. If increasing the buffer does not help, switch back to Fast.
 3. Prefer a microphone and headphone output using the **same Windows host API** (both WASAPI or both MME, ideally same physical USB audio interface). Split-device compatibility mode makes input gaps more likely.
 4. If **late** increases rapidly but XRUN stays low, try CHOIR instead of WALL as a diagnostic. If **mic gaps/drops** increase, focus on audio routing rather than CPU. For testing, close other heavy apps, do not use Bluetooth headphones, and confirm 48kHz device formats.

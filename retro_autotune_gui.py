@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Neon live studio interface for the Retro Auto-Tune v4.7 audio engine.
+"""Neon live studio interface for the Retro Auto-Tune v4.8 audio engine.
 
 Tkinter only for controls/visuals, NumPy and sounddevice for audio.
 No Tk functions run on the PortAudio callback thread. Use wired headphones.
 """
 from __future__ import annotations
 
+from collections import deque
 import math
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,7 @@ from tkinter import ttk, messagebox, filedialog
 import numpy as np
 
 from retro_autotune import (
-    HOP, SAMPLE_RATE, KEYS, SCALES, VoiceEffects, allowed_notes
+    HOP, SAMPLE_RATE, KEYS, SCALES, BackingBand, VoiceEffects, allowed_notes
 )
 from mp3_recorder import Mp3Recorder
 from session_settings import (
@@ -62,7 +63,7 @@ class MicGapSmoother:
         self.fade_down = np.linspace(1.0, 0.0, ramp, dtype=np.float32)
         self.fade_up = np.linspace(0.0, 1.0, ramp, dtype=np.float32)
 
-    def process(self, block, missing):
+    def process(self, block, missing, jumped=False):
         if missing:
             result = np.zeros_like(block)
             if not self.missing:
@@ -71,13 +72,114 @@ class MicGapSmoother:
             self.last = 0.0
             self.missing = True
             return result
-        if self.missing:
+        if self.missing or jumped:
             block = block.copy()
             n = min(self.ramp, len(block))
             block[:n, 0] *= self.fade_up[:n]
+            if jumped:
+                block[:n, 0] += self.last * self.fade_down[:n]
         self.missing = False
         self.last = float(block[-1, 0])
         return block
+
+
+class SplitMicBuffer:
+    """Match independent clocks, allowing one spare hop beyond a driver burst."""
+
+    max_adjust = 2    # at most two input samples stretched/compressed per output hop
+    max_burst = 8     # accommodate back-to-back callbacks from buffered drivers
+
+    def __init__(self):
+        self.blocks = deque(maxlen=self.max_burst + 4)
+        self.input_position = 0
+        self.last_input = 0
+        self.arrivals = deque(maxlen=32)
+        self.phase = 0
+        self.phases = deque([0], maxlen=128)
+        self.read_position = None
+        self.priming = False
+        self.fill_error = 0.0
+        self.correction = 0.0
+        self.gaps = 0
+        self.drops = 0
+        self.smoother = MicGapSmoother()
+        self.silence = np.zeros((HOP, 1), dtype=np.float32)
+        self.axis = np.arange(HOP + self.max_adjust)
+        self.positions = {n: np.linspace(0, n - 1, HOP)
+                          for n in range(HOP - self.max_adjust, HOP + self.max_adjust + 1)
+                          if n != HOP}
+
+    def push(self, indata):
+        # PortAudio reuses indata. Publish complete, independently owned blocks.
+        self.blocks.append((self.input_position, indata[:, 0].copy()))
+        self.input_position += HOP
+
+    def read(self):
+        # Snapshot the small deque so the producer can append/evict throughout
+        # resampling without touching any of the arrays the consumer is reading.
+        blocks = tuple(self.blocks)
+        if not blocks:
+            return self.smoother.process(self.silence, True)
+        first = blocks[0][0]
+        end = blocks[-1][0] + HOP
+        incoming = (end - self.last_input) // HOP
+        self.last_input = end
+        self.arrivals.append(incoming if incoming <= self.max_burst else 1)
+        burst = max(1, max(self.arrivals))
+        prime = (burst + 1) * HOP
+        # At the low point of the recent input-minus-output clock difference we
+        # want two hops before reading. The excess at other points is normal
+        # driver jitter, including batches that arrive just before a read.
+        self.phase += incoming - 1
+        self.phases.append(self.phase)
+        jitter = min(self.max_burst - 1, self.phase - min(self.phases))
+        target = (2 + jitter) * HOP
+        if self.read_position is None:
+            if end - first < prime:
+                return self.smoother.process(self.silence, True)
+            self.read_position = end - prime
+
+        available = end - self.read_position
+        jumped = available > max(6 * HOP, target + 2 * HOP)
+        if jumped:
+            # After a real stall, discard stale mic audio and crossfade the splice.
+            self.drops += (available - prime + HOP - 1) // HOP
+            self.read_position = end - prime
+            available = prime
+            self.phases.clear()
+            self.fill_error = self.correction = 0.0
+        if self.priming and available >= prime:
+            self.priming = False
+        if self.priming or available < HOP - self.max_adjust:
+            if not self.priming:
+                self.read_position = end
+                self.priming = True
+                self.fill_error = self.correction = 0.0
+            self.phases.clear()
+            self.gaps += 1
+            return self.smoother.process(self.silence, True)
+
+        # Filter out callback ordering jitter. Accumulate sub-sample corrections
+        # so a small persistent clock difference never needs a whole-block slip.
+        self.fill_error += (available - target - self.fill_error) / 32
+        self.correction += max(-self.max_adjust, min(self.max_adjust, self.fill_error / 192))
+        adjust = math.trunc(self.correction)
+        self.correction -= adjust
+        take = min(HOP + adjust, available)
+        index, offset = divmod(self.read_position - first, HOP)
+        self.read_position += take
+        remaining = take
+        parts = []
+        while remaining:
+            part = blocks[index][1][offset:offset + remaining]
+            parts.append(part)
+            remaining -= len(part)
+            index += 1
+            offset = 0
+        samples = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        if take != HOP:
+            samples = np.interp(self.positions[take], self.axis[:take], samples).astype(np.float32)
+        return self.smoother.process(samples[:, None], False, jumped)
 
 
 class AudioWorker:
@@ -147,6 +249,9 @@ class AudioWorker:
             self.events.put(("record_stopping", "Finishing MP3…"))
 
     def command(self, name, value):
+        if name == "key_scale":
+            key, scale = value
+            value = (key, scale, BackingBand.prepare_chords(key, scale))
         self.commands.put((name, value))
 
     @staticmethod
@@ -193,12 +298,12 @@ class AudioWorker:
         elif name == "gain":
             fx.gain = float(value)
         elif name == "key_scale":
-            key, scale = value
+            key, scale, *prepared = value
             fx.candidates = allowed_notes(key, scale)
             fx.scale = scale
             fx.current_target = None
             fx.last_note = "--"
-            fx.band.set_key_scale(key, scale)
+            fx.band.set_key_scale(key, scale, *prepared)
 
     @staticmethod
     def host_api_mismatch(sd, mic, headphones):
@@ -247,9 +352,8 @@ class AudioWorker:
                 groove=c["groove"], voice_octave=c["voice_octave"],
             )
 
-            def render(indata, outdata, frames, status):
+            def render(indata, outdata, frames, status, started_ns):
                 """Common processor for duplex and split-stream outputs."""
-                started_ns = time.perf_counter_ns()
                 outdata.fill(0)
                 try:
                     if self.stop_event.is_set():
@@ -333,7 +437,7 @@ class AudioWorker:
                     raise sd.CallbackAbort
 
             def duplex_callback(indata, outdata, frames, callback_time, status):
-                render(indata, outdata, frames, status)
+                render(indata, outdata, frames, status, time.perf_counter_ns())
 
             def monitor(streams, mode):
                 self.running = True
@@ -349,10 +453,7 @@ class AudioWorker:
             def split_streams():
                 # Two independent PortAudio streams allow devices from different
                 # Windows audio host APIs (for example MME mic + WASAPI headphones).
-                # Keep a bounded FIFO: if device clocks drift, drop old microphone
-                # frames rather than allowing progressively larger vocal latency.
-                microphone_frames = queue.Queue(maxsize=3)
-                smoother = MicGapSmoother()
+                microphone = SplitMicBuffer()
 
                 def input_callback(indata, frames, callback_time, status):
                     if self.stop_event.is_set():
@@ -363,29 +464,13 @@ class AudioWorker:
                         raise sd.CallbackAbort
                     if status:
                         self.total_xruns += 1
-                    data = indata.copy()
-                    try:
-                        microphone_frames.put_nowait(data)
-                    except queue.Full:
-                        self.mic_drops += 1
-                        try:
-                            microphone_frames.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            microphone_frames.put_nowait(data)
-                        except queue.Full:
-                            pass
+                    microphone.push(indata)
 
                 def output_callback(outdata, frames, callback_time, status):
-                    try:
-                        captured = microphone_frames.get_nowait()
-                        missing = False
-                    except queue.Empty:
-                        captured = np.zeros((HOP, 1), dtype=np.float32)
-                        missing = True
-                        self.mic_gaps += 1
-                    render(smoother.process(captured, missing), outdata, frames, status)
+                    started_ns = time.perf_counter_ns()
+                    captured = microphone.read()
+                    self.mic_gaps, self.mic_drops = microphone.gaps, microphone.drops
+                    render(captured, outdata, frames, status, started_ns)
 
                 self.events.put(("starting", "Using separate microphone/headphone streams for Windows API compatibility..."))
                 with sd.InputStream(device=c["input"], samplerate=SAMPLE_RATE,
@@ -859,7 +944,7 @@ class StudioApp:
         self._button(bpmrow, "+ 5", lambda: self._set_bpm(self.bpm_var.get()+5)).pack(side="right")
         self._label(band, "Tempo-locked drums · vocal-guided bass & guitar chords", MUTED, 9).pack(anchor="w", padx=14, pady=12)
 
-        self._label(body, "v4.7  ·  Audio stability diagnostics · session restore · Song Mode · MAX CHAOS",
+        self._label(body, "v4.8  ·  Live audio stability · Song Mode · MAX CHAOS",
                     MUTED, 9).pack(padx=18, pady=(0, 24))
         self._sync_controls()
         self._wave_grid()

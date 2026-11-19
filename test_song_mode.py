@@ -127,6 +127,23 @@ class SongBrainTests(unittest.TestCase):
         AudioWorker.apply_command(fx, 'song_mode', False)
         self.assertFalse(fx.band.song.enabled)
 
+    def test_full_memory_bounded_search_agrees_with_exhaustive_alignment(self):
+        rng = np.random.default_rng(2008)
+        motifs = [{"events": tuple(zip(rng.integers(48, 73, 28).tolist(),
+                                      (512*rng.integers(9, 25, 28)).tolist()))}
+                  for _ in range(self.brain.max_motifs)]
+        self.brain.motifs = motifs
+        remembered = motifs[-1]["events"]
+        moved = [(note + 4, duration + 256) for note, duration in remembered]
+        for query, prefix in ((remembered, False), (moved[:17], True),
+                              (moved[:16] + moved[17:], False),
+                              (list(reversed(moved)), False)):
+            scores = [self.brain._score(query, m["events"], prefix) for m in motifs]
+            best = min(range(len(motifs)), key=scores.__getitem__)
+            threshold = .24 if prefix else .35
+            expected = motifs[best] if scores[best] <= threshold else None
+            self.assertIs(self.brain._match(query, prefix), expected)
+
 
 if __name__ == '__main__':
     unittest.main()

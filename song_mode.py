@@ -88,7 +88,7 @@ class SongBrain:
         return tuple(duration / typical for duration in durations)
 
     @classmethod
-    def _score(cls, events, candidate, prefix=False):
+    def _score(cls, events, candidate, prefix=False, limit=math.inf):
         """Pitch-contour similarity with mild rhythmic tolerance.
 
         A one-semitone mistake or small timing variation should still match.
@@ -107,27 +107,45 @@ class SongBrain:
         if max(a) - min(a) < 2 or max(b) - min(b) < 2:
             return 99.0
         # For a one-note ornament use a small monotonic alignment penalty.
-        da, db = cls._duration_pattern(events), cls._duration_pattern(candidate)
+        da = [math.log2(max(.1, d)) for d in cls._duration_pattern(events)]
+        db = [math.log2(max(.1, d)) for d in cls._duration_pattern(candidate)]
         m, n = len(a), len(b)
-        prev = [j * 1.25 for j in range(n + 1)]
+        gap = 1.25
+        max_cost = limit * max(m, n)
+        # Each move away from the diagonal must be paid for with gaps, including
+        # the moves needed to finish at (m, n). Omit paths that cannot match.
+        delta = n - m
+        max_gaps = int((max_cost + 1e-12) / gap) if math.isfinite(max_cost) else m + n
+        if max_gaps < abs(delta):
+            return 99.0
+        margin = (max_gaps - abs(delta)) // 2
+        low = min(0, delta) - margin
+        high = max(0, delta) + margin
+        pitch_costs = (0.0, 0.0, .70, 2*.70, 3*.70, 4*.70)
+        prev = [j * gap for j in range(n + 1)]
         for i in range(1, m + 1):
-            curr = [i * 1.25] + [0.0] * n
-            for j in range(1, n + 1):
+            curr = [i * gap] + [math.inf] * n
+            for j in range(max(1, i + low), min(n, i + high) + 1):
                 pitch_error = abs(a[i - 1] - b[j - 1])
-                note_cost = 0 if pitch_error <= 1 else min(3.0, (pitch_error - 1) * 0.70)
-                timing_cost = min(1.0, abs(math.log2(max(.1, da[i-1]) / max(.1, db[j-1])))) * 0.12
+                note_cost = pitch_costs[pitch_error] if pitch_error < 6 else 3.0
+                timing_cost = min(1.0, abs(da[i-1] - db[j-1])) * 0.12
                 curr[j] = min(prev[j - 1] + note_cost + timing_cost,
-                              prev[j] + 1.25, curr[j - 1] + 1.25)
+                              prev[j] + gap, curr[j - 1] + gap)
+            if min(curr) > max_cost + 1e-12:
+                return 99.0
             prev = curr
         return prev[n] / max(m, n)
 
     def _match(self, events, prefix=False):
         best, score = None, 99.0
+        threshold = 0.24 if prefix else 0.35
         for motif in self.motifs:
-            d = self._score(events, motif["events"], prefix=prefix)
+            d = self._score(events, motif["events"], prefix=prefix, limit=min(score, threshold))
             if d < score:
                 best, score = motif, d
-        if score <= (0.24 if prefix else 0.35):
+                if score == 0.0:
+                    break
+        if score <= threshold:
             return best
         return None
 

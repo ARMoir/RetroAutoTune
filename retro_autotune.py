@@ -69,7 +69,9 @@ def detect_pitch_yin(samples, sr=SAMPLE_RATE):
         return 0.0, 0.0
 
     segment = np.asarray(samples[-(YIN_WINDOW + max_lag):], dtype=np.float64)
-    segment = segment - np.mean(segment)
+    # Test the reference window's own AC energy. A loud attack in the newer
+    # samples must not make preceding silence look like a voiced reference.
+    segment = segment - np.mean(segment[:YIN_WINDOW])
     reference = segment[:YIN_WINDOW]
     if np.mean(reference * reference) < 1e-7:
         return 0.0, 0.0
@@ -114,40 +116,50 @@ def detect_pitch_yin(samples, sr=SAMPLE_RATE):
 
 
 class StreamingPitchShifter:
-    """Two grain delay heads with crossfading, fixed ~13-40 ms DSP delay.
+    """Two crossfaded grain heads with a 1–1281 sample read delay.
 
     A deliberately small, vocal-oriented prototype. Transient smearing and
     grain texture are expected, especially during note changes.
     """
 
+    steps = np.arange(HOP, dtype=np.float64)
+
     def __init__(self, sample_rate=SAMPLE_RATE):
-        self.buffer = np.zeros(8192, dtype=np.float32)
-        self.mask = len(self.buffer) - 1
+        # Two copies let either head read straight across the ring boundary.
+        # History must cover the longest grain delay plus the block just written.
+        self.capacity = 4096
+        self.buffer = np.zeros(2 * self.capacity, dtype=np.float32)
         self.write_position = 0
         self.phase = 0.0
-        self.base_delay = 640.0  # Must exceed the callback's 512-frame block.
+        self.base_delay = 1.0
         self.delay_sweep = 1280.0
-        self.steps = np.arange(HOP, dtype=np.float64)
 
     def _read_delay(self, positions):
-        lower = np.floor(positions).astype(np.int64)
+        lower = positions.astype(np.intp)  # positions are always nonnegative
         fraction = positions - lower
-        a = self.buffer[lower & self.mask]
-        b = self.buffer[(lower + 1) & self.mask]
+        a = self.buffer[lower]
+        b = self.buffer[lower + 1]
         return a + (b - a) * fraction
 
-    def process(self, block, semitones):
+    def process(self, block, semitones, *, audible=True):
         if len(block) != HOP:
             raise ValueError("Unexpected audio block size")
-        # All read delays exceed HOP, so bulk writing cannot overwrite any
-        # sample needed to render the current block.
-        positions = self.write_position + self.steps
-        self.buffer[positions.astype(np.int64) & self.mask] = block
-
+        start = self.write_position
+        mirror = self.capacity + start
+        self.buffer[start:start + HOP] = block
+        self.buffer[mirror:mirror + HOP] = block
         playback_ratio = 2.0 ** (float(semitones) / 12.0)
         phase_step = (1.0 - playback_ratio) / self.delay_sweep
-        phase_a = (self.phase + phase_step * self.steps) % 1.0
-        phase_b = (phase_a + 0.5) % 1.0
+        phase = self.phase
+        self.phase = (phase + HOP * phase_step) % 1.0
+        self.write_position = (start + HOP) % self.capacity
+        if not audible:
+            return  # Keep history and phase in sync for a live octave toggle.
+        positions = mirror + self.steps
+        phase_a = phase + phase_step * self.steps
+        phase_a -= np.floor(phase_a)
+        phase_b = phase_a + 0.5
+        phase_b -= np.floor(phase_b)
         delay_a = self.base_delay + phase_a * self.delay_sweep
         delay_b = self.base_delay + phase_b * self.delay_sweep
         head_a = self._read_delay(positions - delay_a)
@@ -155,8 +167,6 @@ class StreamingPitchShifter:
 
         gain_a = 0.5 - 0.5 * np.cos(2.0 * np.pi * phase_a)
         output = gain_a * head_a + (1.0 - gain_a) * head_b
-        self.phase = (self.phase + HOP * phase_step) % 1.0
-        self.write_position = (self.write_position + HOP) & self.mask
         return output.astype(np.float32)
 
 
@@ -164,46 +174,73 @@ class SimpleHighPass:
     """One-pole high pass at ~80Hz, used to suppress low frequency rumble."""
 
     def __init__(self, sample_rate=SAMPLE_RATE, cutoff=80.0):
-        self.alpha = math.exp(-2.0 * math.pi * cutoff / sample_rate)
-        self.previous_in = 0.0
-        self.previous_out = 0.0
+        exponent = -2.0 * math.pi * cutoff / sample_rate
+        self.alpha = math.exp(exponent)
+        # Unroll the complementary one-pole low-pass with a weighted prefix sum.
+        # Bound the exponent even for unusual cutoffs or long input arrays.
+        width = min(HOP, max(1, int(32 / max(abs(exponent), 1e-12))))
+        self.decay = np.exp(exponent * np.arange(width, dtype=np.float64))
+        self.weights = (1.0 - self.alpha) / self.decay
+        self.low = 0.0
 
     def process(self, audio):
         out = np.empty_like(audio)
-        x0, y0 = self.previous_in, self.previous_out
-        for i, x in enumerate(audio):
-            x = float(x)
-            y0 = self.alpha * (y0 + x - x0)
-            out[i] = y0
-            x0 = x
-        self.previous_in, self.previous_out = x0, y0
+        width = len(self.decay)
+        for start in range(0, len(audio), width):
+            block = audio[start:start + width]
+            n = len(block)
+            low = self.decay[:n] * (self.alpha * self.low +
+                                     np.cumsum(block * self.weights[:n]))
+            out[start:start + n] = block - low
+            self.low = float(low[-1])
         return out
 
 
-class FeedbackDelay:
-    """Vectorized integer delay with stable, damped internal feedback.
+class BlockDelayLine:
+    """Integer delay with contiguous block reads and writes."""
 
-    The minimum delay is larger than one callback block, so the full block can
-    be processed without same-block feedback or sample-by-sample Python loops.
-    """
-
-    def __init__(self, delay_samples, block_size=HOP):
+    def __init__(self, delay_samples, block_size):
         if delay_samples <= block_size:
             raise ValueError("Delay must exceed callback block size")
         self.delay_samples = int(delay_samples)
-        self.buffer = np.zeros(1 << (self.delay_samples + block_size).bit_length(), dtype=np.float32)
-        self.mask = len(self.buffer) - 1
+        self.block_size = block_size
+        # Round up to whole blocks and mirror block zero at the end. The extra
+        # block of history keeps the read span independent of the write span.
+        self.capacity = ((self.delay_samples - 1) // block_size + 2) * block_size
+        self.buffer = np.zeros(self.capacity + block_size, dtype=np.float32)
         self.position = 0
-        self.indices = np.arange(block_size, dtype=np.int64)
+
+    def _read(self):
+        start = (self.position - self.delay_samples) % self.capacity
+        return self.buffer[start:start + self.block_size]
+
+    def _write(self, block):
+        self.buffer[self.position:self.position + self.block_size] = block
+        if self.position == 0:
+            self.buffer[self.capacity:] = block
+        self.position = (self.position + self.block_size) % self.capacity
+
+    def clear(self):
+        self.buffer.fill(0)
+
+
+class FeedbackDelay(BlockDelayLine):
+    """Integer delay with stable, damped internal feedback."""
+
+    def __init__(self, delay_samples, block_size=HOP):
+        super().__init__(delay_samples, block_size)
+        self.prev_sample = 0.0
+
+    def clear(self):
+        super().clear()
         self.prev_sample = 0.0
 
     def process(self, x, feedback=0.0, damping=0.0):
-        if len(x) != len(self.indices):
+        if len(x) != self.block_size:
             raise ValueError("Unexpected audio block size")
         if not 0.0 <= feedback < 1.0:
             raise ValueError("Unstable feedback value")
-        positions = self.position + self.indices
-        delayed = self.buffer[(positions - self.delay_samples) & self.mask].copy()
+        delayed = self._read().copy()
         if damping:
             # FIR low-pass on the recirculated signal prevents fizzy resonance.
             previous = np.empty_like(delayed)
@@ -213,30 +250,20 @@ class FeedbackDelay:
         else:
             filtered = delayed
         self.prev_sample = float(delayed[-1])
-        self.buffer[positions & self.mask] = x + feedback * filtered
-        self.position = (self.position + len(x)) & self.mask
+        self._write(x + feedback * filtered if feedback else x)
         return delayed
 
 
-class AllPassDiffuser:
+class AllPassDiffuser(BlockDelayLine):
     """Schroeder all-pass stage for a smooth synthetic reverb field."""
 
     def __init__(self, delay_samples, gain=0.52):
-        if delay_samples <= HOP:
-            raise ValueError("All-pass delay must exceed callback block size")
-        self.buffer = np.zeros(1 << (delay_samples + HOP).bit_length(), dtype=np.float32)
-        self.mask = len(self.buffer) - 1
-        self.position = 0
-        self.indices = np.arange(HOP, dtype=np.int64)
-        self.delay_samples = int(delay_samples)
+        super().__init__(delay_samples, HOP)
         self.gain = float(gain)
 
     def process(self, signal):
-        positions = self.position + self.indices
-        delayed = self.buffer[(positions - self.delay_samples) & self.mask].copy()
-        output = delayed - self.gain * signal
-        self.buffer[positions & self.mask] = signal + self.gain * output
-        self.position = (self.position + len(signal)) & self.mask
+        output = self._read() - self.gain * signal
+        self._write(signal + self.gain * output)
         return output
 
 
@@ -265,6 +292,12 @@ class CherStyleReverb:
             FeedbackDelay(round(sample_rate * 0.108)),
             FeedbackDelay(round(sample_rate * 0.137)),
         ]
+
+    def clear(self):
+        self.predelay.clear()
+        for stages in (*self.combs, *self.diffusers, self.slaps):
+            for stage in stages:
+                stage.clear()
 
     def process(self, voice):
         predelayed = self.predelay.process(voice)
@@ -410,25 +443,24 @@ class BackingBand:
         self.last_chord_step = -16
         self.set_key_scale(key, scale)
 
-    def set_key_scale(self, key, scale):
-        self.root = KEYS[key.upper()]
-        self.scale = scale
+    @staticmethod
+    def prepare_chords(key, scale):
+        """Build the guitar strums before a live key change reaches the renderer."""
+        root = KEYS[key.upper()]
         # Pentatonic/chromatic melodies can still use standard diatonic triads.
         intervals = SCALES[scale] if len(SCALES[scale]) == 7 else SCALES["major"]
-        self.degree_intervals = tuple(intervals)
-        self.chords = (0, 8, 3, 10) if scale == "minor" else (0, 7, 9, 5)
-        self.triads = []
-        self.guitar_samples = {}
-        for degree, interval in enumerate(intervals):
+        triads = []
+        guitar_samples = {}
+        for degree in range(len(intervals)):
             semitones = tuple(int(intervals[(degree + offset) % 7] +
                                   12 * ((degree + offset) // 7))
                               for offset in (0, 2, 4))
             # A C4-centred guitar voicing is good for the synth's finite range.
-            chord = [48 + self.root + x for x in semitones]
+            chord = [48 + root + x for x in semitones]
             if chord[0] > 60:
                 chord = [x - 12 for x in chord]
             pcs = tuple(p % 12 for p in chord)
-            self.triads.append(pcs)
+            triads.append(pcs)
             notes = [make_guitar_sample(p) for p in chord]
             for direction in ("down", "up"):
                 ordered = notes if direction == "down" else list(reversed(notes))
@@ -436,13 +468,22 @@ class BackingBand:
                 for idx, note in enumerate(ordered):
                     offset = idx * 520  # Eleven milliseconds between strings
                     strum[offset:offset + len(note)] += note * 0.72
-                self.guitar_samples[(degree, direction)] = strum
+                guitar_samples[(degree, direction)] = strum
+        return intervals, triads, guitar_samples
+
+    def set_key_scale(self, key, scale, prepared=None):
+        self.root = KEYS[key.upper()]
+        self.scale = scale
+        self.chords = (0, 8, 3, 10) if scale == "minor" else (0, 7, 9, 5)
+        if prepared is None:
+            prepared = self.prepare_chords(key, scale)
+        self.degree_intervals, self.triads, self.guitar_samples = prepared
         self.pitch_evidence.fill(0.0)
         self.voiced_updates = 0
         self.song.reset()  # A changed key/scale invalidates remembered chord degrees.
         self.chord_degree = 0
         self.last_chord_step = -16
-        self.chord_name = NOTE_NAMES[(self.root + intervals[0]) % 12]
+        self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[0]) % 12]
         # Avoid leaving old-key chord samples ringing on a scale/key change.
         self.guitar.active.clear()
         self.bass.active.clear()
@@ -566,10 +607,11 @@ class BackingBand:
         start, stop = self.sample_counter, self.sample_counter + HOP
         drum_events, bass_events, guitar_events = [], [], []
         step_duration = 1.0 / self.steps_per_sample
-        while self.next_step_sample < stop:
-            offset = int(round(self.next_step_sample)) - start
-            if 0 <= offset < HOP:
-                self._schedule_step(self.step_index, offset, drum_events, bass_events, guitar_events)
+        # Decide block ownership on the same integer sample grid as playback.
+        # A step rounded to 'stop' belongs at offset zero of the next block.
+        while round(self.next_step_sample) < stop:
+            offset = round(self.next_step_sample) - start
+            self._schedule_step(self.step_index, offset, drum_events, bass_events, guitar_events)
             self.step_index += 1
             self.next_step_sample += step_duration
         self.sample_counter = stop
@@ -629,6 +671,9 @@ class VoiceEffects:
             raise ValueError("Unknown backing vocal mode")
         self.harmony_shifters = [StreamingPitchShifter() for _ in HARMONY_VOICES]
         self.harmony_delays = [FeedbackDelay(config[4]) for config in HARMONY_VOICES]
+        self.harmony_pans = [(math.sqrt(2) * math.cos((v[2] + 1) * math.pi / 4),
+                              math.sqrt(2) * math.sin((v[2] + 1) * math.pi / 4))
+                             for v in HARMONY_VOICES]
         self.harmony_shifts = [0.0] * len(HARMONY_VOICES)
         self.harmony_envelopes = np.zeros(len(HARMONY_VOICES), dtype=np.float32)
         self.harmony_mode = backing_vocals
@@ -720,7 +765,7 @@ class VoiceEffects:
             tuned = (tuned * (1.0 - mix) + upper * mix).astype(np.float32)
         else:
             # Keep the octave engine's input history warm for runtime E toggles.
-            self.octave_shifter.process(filtered, self.shift + octave_semitones + 12.0)
+            self.octave_shifter.process(filtered, self.shift + octave_semitones + 12.0, audible=False)
 
         drive = 2.25 if self.preset == "extreme" else 1.35
         voice = (0.74 * np.tanh(tuned * (self.gain * drive))).astype(np.float32)
@@ -746,8 +791,7 @@ class VoiceEffects:
             shifted = self.harmony_delays[i].process(shifted)
             singer = np.tanh(shifted * (self.gain * 1.30)).astype(np.float32)
             # Convert equal-power pan to unity at the centre.
-            angle = (pan + 1.0) * np.pi * 0.25
-            left, right = np.sqrt(2.0) * np.cos(angle), np.sqrt(2.0) * np.sin(angle)
+            left, right = self.harmony_pans[i]
             amount = new_env * weight
             choir[:, 0] += singer * amount * left
             choir[:, 1] += singer * amount * right
@@ -757,9 +801,14 @@ class VoiceEffects:
         dry = voice[:, None] + choir
         wet_goal = self.reverb_mix if self.reverb_enabled else 0.0
         self.wet_current += 0.09 * (wet_goal - self.wet_current)
-        wet = self.reverb_engine.process(np.mean(dry, axis=1))
-        # Keep the robotic lead intelligible under the expanded harmonies.
-        final = dry * (1.0 - 0.30 * self.wet_current) + wet * self.wet_current
+        if wet_goal > 0.0 or self.wet_current > 1e-5:
+            wet = self.reverb_engine.process((dry[:, 0] + dry[:, 1]) * 0.5)
+            final = dry * (1.0 - 0.30 * self.wet_current) + wet * self.wet_current
+        else:
+            if self.wet_current:
+                self.reverb_engine.clear()  # A later restart begins with fresh audio.
+                self.wet_current = 0.0
+            final = dry
         # The backing band runs on its own clock; microphone gate never stops it.
         music = self.band.process()
         # Light, smooth ducking under sung phrases keeps vocals intelligible.
@@ -769,7 +818,7 @@ class VoiceEffects:
         # Shared output soft limiter safely bounds voice + band + reverb.
         final = (0.87 * np.tanh(final * 1.06)).astype(np.float32)
         if self.mono_output:
-            return np.mean(final, axis=1, keepdims=True).astype(np.float32)
+            return (final[:, :1] + final[:, 1:]) * 0.5
         return final
 
 
