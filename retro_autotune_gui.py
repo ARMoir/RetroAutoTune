@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neon live studio interface for the Retro Auto-Tune v4.5 audio engine.
+"""Neon live studio interface for the Retro Auto-Tune v4.7 audio engine.
 
 Tkinter only for controls/visuals, NumPy and sounddevice for audio.
 No Tk functions run on the PortAudio callback thread. Use wired headphones.
@@ -39,6 +39,47 @@ ORANGE = "#ffb45c"
 RED = "#ff6b7d"
 
 
+# A larger device buffer is optional for unstable Windows driver combinations.
+# Never silently request high-latency monitoring; let the performer select it.
+AUDIO_PROFILES = {"Fast": "low", "Balanced": 0.030, "Stable": 0.065}
+
+
+def stream_latency(profile):
+    return AUDIO_PROFILES.get(profile, "low")
+
+
+class MicGapSmoother:
+    """Make a missed/returned split-device mic block click-free.
+
+    Each missing input frame is a real device dropout; the band still runs on
+    the output clock. We ramp down the final mic sample rather than injecting
+    a hard discontinuity, and fade the next valid microphone block in.
+    """
+    def __init__(self, ramp=96):
+        self.ramp = ramp
+        self.last = 0.0
+        self.missing = False
+        self.fade_down = np.linspace(1.0, 0.0, ramp, dtype=np.float32)
+        self.fade_up = np.linspace(0.0, 1.0, ramp, dtype=np.float32)
+
+    def process(self, block, missing):
+        if missing:
+            result = np.zeros_like(block)
+            if not self.missing:
+                n = min(self.ramp, len(block))
+                result[:n, 0] = self.last * self.fade_down[:n]
+            self.last = 0.0
+            self.missing = True
+            return result
+        if self.missing:
+            block = block.copy()
+            n = min(self.ramp, len(block))
+            block[:n, 0] *= self.fade_up[:n]
+        self.missing = False
+        self.last = float(block[-1, 0])
+        return block
+
+
 class AudioWorker:
     """Audio device ownership and rendering remain outside the Tk mainloop."""
 
@@ -53,6 +94,14 @@ class AudioWorker:
         self.callback_count = 0
         self.callback_error = None
         self.overloads = 0
+        self.total_xruns = 0
+        self.mic_gaps = 0
+        self.mic_drops = 0
+        self.dsp_ms = 0.0
+        self.peak_dsp_ms = 0.0
+        self.late_blocks = 0
+        self.cpu_pressure = 0
+        self.audio_budget_ms = HOP * 1000.0 / SAMPLE_RATE
         self.volume = float(config["volume"])
         self.history = np.zeros(2048, dtype=np.float32)
         self.recorder = None
@@ -175,6 +224,7 @@ class AudioWorker:
             import sounddevice as sd
             c = self.config
             channels = 2 if c["stereo"] else 1
+            device_latency = stream_latency(c.get("audio_profile", "Fast"))
             sd.check_input_settings(device=c["input"], channels=1,
                                     samplerate=SAMPLE_RATE, dtype="float32")
             sd.check_output_settings(device=c["output"], channels=channels,
@@ -199,6 +249,7 @@ class AudioWorker:
 
             def render(indata, outdata, frames, status):
                 """Common processor for duplex and split-stream outputs."""
+                started_ns = time.perf_counter_ns()
                 outdata.fill(0)
                 try:
                     if self.stop_event.is_set():
@@ -207,6 +258,7 @@ class AudioWorker:
                         raise ValueError(f"Driver delivered {frames} frames, expected {HOP}")
                     if status:
                         self.overloads += 1
+                        self.total_xruns += 1
                         if self.overloads >= 20:
                             raise RuntimeError(f"Repeated audio underrun/overrun: {status}")
                     else:
@@ -228,7 +280,8 @@ class AudioWorker:
                     self.history[:-HOP] = self.history[HOP:]
                     self.history[-HOP:] = outdata[:, 0]
                     self.callback_count += 1
-                    if self.callback_count % 4 == 0:
+                    # Visualizer should not compete for the Python GIL with DSP.
+                    if self.callback_count % 8 == 0:
                         snapshot = {
                             "samples": self.history.copy(),
                             "input_db": 20 * math.log10(max(1e-6, float(np.sqrt(np.mean(indata[:, 0] ** 2))))),
@@ -246,11 +299,33 @@ class AudioWorker:
                             "step": fx.band.step_index,
                             "bpm": fx.band.bpm,
                             "overloads": self.overloads,
+                            "xruns": self.total_xruns,
+                            "mic_gaps": self.mic_gaps,
+                            "mic_drops": self.mic_drops,
+                            "dsp_ms": self.dsp_ms,
+                            "peak_ms": self.peak_dsp_ms,
+                            "late_blocks": self.late_blocks,
+                            "pitch_stride": fx.pitch_detection_stride,
                         }
                         try:
                             self.meters.put_nowait(snapshot)
                         except queue.Full:
                             pass  # Never block live audio to refresh a visual.
+                    # Measure the *whole* callback, including occasional visual snapshots.
+                    elapsed_ms = (time.perf_counter_ns() - started_ns) / 1e6
+                    self.dsp_ms += 0.12 * (elapsed_ms - self.dsp_ms)
+                    self.peak_dsp_ms = max(elapsed_ms, self.peak_dsp_ms * 0.997)
+                    if elapsed_ms > self.audio_budget_ms:
+                        self.late_blocks += 1
+                    # Automatic CPU guard: less frequent pitch *detection* under
+                    # sustained pressure, but never remove any choir or band voices.
+                    # Preserve original pitch behavior whenever there is headroom.
+                    if elapsed_ms > self.audio_budget_ms * 0.74 or status:
+                        self.cpu_pressure = min(30, self.cpu_pressure + 3)
+                    else:
+                        self.cpu_pressure = max(0, self.cpu_pressure - 1)
+                    fx.pitch_detection_stride = (3 if self.cpu_pressure >= 23 else
+                                                 2 if self.cpu_pressure >= 12 else 1)
                 except Exception:
                     self.callback_error = traceback.format_exc()
                     outdata.fill(0)
@@ -276,8 +351,8 @@ class AudioWorker:
                 # Windows audio host APIs (for example MME mic + WASAPI headphones).
                 # Keep a bounded FIFO: if device clocks drift, drop old microphone
                 # frames rather than allowing progressively larger vocal latency.
-                microphone_frames = queue.Queue(maxsize=4)
-                silence = np.zeros((HOP, 1), dtype=np.float32)
+                microphone_frames = queue.Queue(maxsize=3)
+                smoother = MicGapSmoother()
 
                 def input_callback(indata, frames, callback_time, status):
                     if self.stop_event.is_set():
@@ -287,11 +362,12 @@ class AudioWorker:
                         self.stop_event.set()
                         raise sd.CallbackAbort
                     if status:
-                        self.overloads += 1
+                        self.total_xruns += 1
                     data = indata.copy()
                     try:
                         microphone_frames.put_nowait(data)
                     except queue.Full:
+                        self.mic_drops += 1
                         try:
                             microphone_frames.get_nowait()
                         except queue.Empty:
@@ -304,17 +380,20 @@ class AudioWorker:
                 def output_callback(outdata, frames, callback_time, status):
                     try:
                         captured = microphone_frames.get_nowait()
+                        missing = False
                     except queue.Empty:
-                        captured = silence
-                    render(captured, outdata, frames, status)
+                        captured = np.zeros((HOP, 1), dtype=np.float32)
+                        missing = True
+                        self.mic_gaps += 1
+                    render(smoother.process(captured, missing), outdata, frames, status)
 
                 self.events.put(("starting", "Using separate microphone/headphone streams for Windows API compatibility..."))
                 with sd.InputStream(device=c["input"], samplerate=SAMPLE_RATE,
                                     blocksize=HOP, dtype="float32", channels=1,
-                                    latency="low", callback=input_callback) as mic_stream:
+                                    latency=device_latency, callback=input_callback) as mic_stream:
                     with sd.OutputStream(device=c["output"], samplerate=SAMPLE_RATE,
                                          blocksize=HOP, dtype="float32", channels=channels,
-                                         latency="low", callback=output_callback) as output_stream:
+                                         latency=device_latency, callback=output_callback) as output_stream:
                         monitor((mic_stream, output_stream), "split-device mode")
 
             self.events.put(("starting", "Connecting the selected audio devices..."))
@@ -324,7 +403,7 @@ class AudioWorker:
                 try:
                     with sd.Stream(samplerate=SAMPLE_RATE, blocksize=HOP, dtype="float32",
                                    channels=(1, channels), device=(c["input"], c["output"]),
-                                   latency="low", callback=duplex_callback) as stream:
+                                   latency=device_latency, callback=duplex_callback) as stream:
                         monitor((stream,), "duplex mode")
                 except Exception as exc:
                     if not self.is_device_pair_error(exc) or self.stop_event.is_set():
@@ -344,6 +423,8 @@ class StudioApp:
         self.settings_file = settings_file or settings_path()
         self.saved_session = load_session(self.settings_file)
         self._save_after_id = None
+        self._save_write_lock = threading.Lock()
+        self._save_revision = 0
         self._restore_in_progress = True
         saved_devices = self.saved_session.get("devices", {})
         self.preferred_input = saved_devices.get("input")
@@ -361,6 +442,7 @@ class StudioApp:
         self.device_meta_in = {}
         self.device_meta_out = {}
         self.status_var = tk.StringVar(value="STOPPED  ·  Select your microphone and headphones")
+        self.diagnostics_var = tk.StringVar(value="Audio: diagnostics available while running")
         self.note_var = tk.StringVar(value="--")
         self.pitch_var = tk.StringVar(value="Sing into the microphone")
         self.chord_var = tk.StringVar(value="Backing chord: --")
@@ -369,6 +451,7 @@ class StudioApp:
         self.output_var = tk.StringVar()
         self.headphones_var = tk.BooleanVar(value=False)
         self.stereo_var = tk.BooleanVar(value=False)
+        self.audio_profile_var = tk.StringVar(value="Fast")
         self.key_var = tk.StringVar(value="C")
         self.scale_var = tk.StringVar(value="minor")
         self.preset_var = tk.StringVar(value="extreme")
@@ -407,12 +490,13 @@ class StudioApp:
         root.bind("<Configure>", self._resize_layout)
         root.after(120, lambda: self._resize_layout())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self.root.after(40, self._poll)
+        self.root.after(65, self._poll)
 
     def _setting_vars(self):
         """All performer controls that should survive app updates and restarts."""
         return {
             "stereo": self.stereo_var,
+            "audio_profile": self.audio_profile_var,
             "key": self.key_var, "scale": self.scale_var,
             "preset": self.preset_var, "reverb": self.reverb_var,
             "reverb_mix": self.reverb_mix_var,
@@ -473,18 +557,32 @@ class StudioApp:
         # Debounce changes from Tk scales. Never write settings in the audio callback.
         self._save_after_id = self.root.after(500, self._save_session_now)
 
-    def _save_session_now(self):
+    def _save_session_now(self, force=False):
         if self._save_after_id is not None:
             try:
                 self.root.after_cancel(self._save_after_id)
             except Exception:
                 pass
             self._save_after_id = None
-        try:
-            save_session(self._session_payload(), self.settings_file)
-        except (OSError, ValueError) as exc:
-            # Persistence issues must not interrupt a performance.
-            print(f"Warning: could not save RetroAutoTune settings: {exc}")
+        payload = self._session_payload()  # Read Tk vars ONLY on the GUI thread.
+        self._save_revision += 1
+        revision = self._save_revision
+
+        def write_file():
+            try:
+                with self._save_write_lock:
+                    # Prevent an old delayed save overwriting a newer snapshot.
+                    if revision == self._save_revision:
+                        save_session(payload, self.settings_file)
+            except (OSError, ValueError) as exc:
+                print(f"Warning: could not save RetroAutoTune settings: {exc}")
+
+        # Atomic file I/O on the Tk thread can stall the Python audio callback
+        # while performing, due to the GIL and Windows antivirus/file hooks.
+        if not force and self.worker is not None and self.worker.running:
+            threading.Thread(target=write_file, name="AutoTune-Settings-Save", daemon=True).start()
+        else:
+            write_file()
 
     def _setup_styles(self):
         style = ttk.Style(self.root)
@@ -581,7 +679,14 @@ class StudioApp:
             fg=MUTED, bg=PANEL, selectcolor=INNER,
             activebackground=PANEL, activeforeground=WHITE, font=("Segoe UI", 10))
         self.stereo_check.pack(side="right")
-        self._label(devices, "Different Windows audio APIs? The app automatically uses separate streams (slightly more latency).",
+        profile_row = tk.Frame(devices, bg=PANEL)
+        profile_row.pack(fill="x", padx=16, pady=(0, 7))
+        self._label(profile_row, "AUDIO BUFFER  (change before Start)", MUTED, 9).pack(side="left")
+        self.audio_profile_combo = self._combo(profile_row, self.audio_profile_var,
+                                               ("Fast", "Balanced", "Stable"), width=12)
+        self.audio_profile_combo.pack(side="left", padx=12)
+        self._label(profile_row, "Fast = least delay · Stable = fewer crackles", MUTED, 9).pack(side="left")
+        self._label(devices, "Different Windows audio APIs? Separate streams may cause mic gaps; see audio diagnostics.",
                     MUTED, 9).pack(anchor="w", padx=16, pady=(0, 10))
 
         transport = tk.Frame(body, bg=BG)
@@ -601,6 +706,7 @@ class StudioApp:
         self.status_label = self._label(transport, "", MUTED, 10, True,
                                        textvariable=self.status_var, anchor="w", justify="left")
         self.status_label.pack(fill="x", pady=(7, 0))
+        self._label(transport, "", MUTED, 9, textvariable=self.diagnostics_var).pack(fill="x", pady=(2, 0))
         self.transport = transport
 
         vizrow = tk.Frame(body, bg=BG)
@@ -753,7 +859,7 @@ class StudioApp:
         self._button(bpmrow, "+ 5", lambda: self._set_bpm(self.bpm_var.get()+5)).pack(side="right")
         self._label(band, "Tempo-locked drums · vocal-guided bass & guitar chords", MUTED, 9).pack(anchor="w", padx=14, pady=12)
 
-        self._label(body, "v4.6  ·  Last session autosaved · confirm headphones each launch · Song Mode · MAX CHAOS",
+        self._label(body, "v4.7  ·  Audio stability diagnostics · session restore · Song Mode · MAX CHAOS",
                     MUTED, 9).pack(padx=18, pady=(0, 24))
         self._sync_controls()
         self._wave_grid()
@@ -1026,6 +1132,7 @@ class StudioApp:
                 return
         config = {
             "input": self.devices_in[mic], "output": self.devices_out[headphones],
+            "audio_profile": self.audio_profile_var.get(),
             "stereo": self.stereo_var.get(), "key": self.key_var.get(), "scale": self.scale_var.get(),
             "preset": self.preset_var.get(), "reverb": self.reverb_var.get(),
             "reverb_mix": self.reverb_mix_var.get(), "harmony": self.harmony_var.get(),
@@ -1057,6 +1164,7 @@ class StudioApp:
         self.output_combo.configure(state=state)
         self.refresh_btn.configure(state="disabled" if active else "normal")
         self.stereo_check.configure(state="disabled" if active else "normal")
+        self.audio_profile_combo.configure(state="disabled" if active else "readonly")
 
     def stop_audio(self):
         if self.worker:
@@ -1115,11 +1223,17 @@ class StudioApp:
             if last is not None:
                 self.last_snapshot = last
                 self._draw_visuals(last)
+                self.diagnostics_var.set(
+                    f"DSP {last.get('dsp_ms', 0):.1f} ms avg / {last.get('peak_ms', 0):.1f} ms peak "
+                    f"(budget {HOP * 1000 / SAMPLE_RATE:.1f}) · "
+                    f"XRUN {last.get('xruns', 0)} · late {last.get('late_blocks', 0)} · "
+                    f"mic gaps {last.get('mic_gaps', 0)} · mic drops {last.get('mic_drops', 0)} · "
+                    f"pitch stride {last.get('pitch_stride', 1)}x")
             if not self.worker.thread.is_alive():
                 self.worker = None
                 self._transport_state(active=False)
         if not self.closing:
-            self.root.after(40, self._poll)
+            self.root.after(65, self._poll)
         else:
             self.root.after(70, self._poll)
 
@@ -1176,7 +1290,7 @@ class StudioApp:
             item.configure(bg=LIME if on else INNER, fg=BG if on else MUTED)
 
     def _close(self):
-        self._save_session_now()
+        self._save_session_now(force=True)
         self.closing = True
         if self.worker:
             self.worker.stop()

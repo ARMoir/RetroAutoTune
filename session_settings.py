@@ -18,6 +18,7 @@ VERSION = 1
 # Name -> (type, minimum/choices, maximum). Not all numbers are arbitrary.
 FIELDS = {
     "stereo": (bool, None, None),
+    "audio_profile": (str, ("Fast", "Balanced", "Stable"), None),
     "key": (str, ("C", "C#", "DB", "D", "D#", "EB", "E", "F", "F#", "GB", "G", "G#", "AB", "A", "A#", "BB", "B"), None),
     "scale": (str, ("chromatic", "major", "minor", "pentatonic"), None),
     "preset": (str, ("classic", "extreme"), None),

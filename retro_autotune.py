@@ -648,6 +648,11 @@ class VoiceEffects:
         self.shift = 0.0
         self.last_note = "--"
         self.last_confidence = 0.0
+        # Keep normal fast note tracking, but the audio callback may temporarily
+        # set this to 2 or 3 if the machine cannot meet its realtime deadline.
+        # This saves FFT/YIN work before sacrificing any choir/instrument layers.
+        self.pitch_detection_stride = 1
+        self._pitch_detection_counter = 0
         self.preset = preset
         self.reverb_enabled = reverb == "cher"
         self.reverb_mix = float(reverb_mix)
@@ -670,7 +675,8 @@ class VoiceEffects:
         rms = float(np.sqrt(np.mean(samples * samples)))
         gate_goal = 1.0 if rms >= self.gate_threshold else 0.0
         self.gate_level += (0.35 if gate_goal > self.gate_level else 0.10) * (gate_goal - self.gate_level)
-        if gate_goal:
+        self._pitch_detection_counter += 1
+        if gate_goal and self._pitch_detection_counter % self.pitch_detection_stride == 0:
             hz, confidence = detect_pitch_yin(self.detector_history)
             self.last_confidence = confidence
             if hz > 0.0:

@@ -38,6 +38,26 @@ See **[MicStation hardware roadmap](docs/MICSTATION_ROADMAP.md)** for phased imp
 
 CLI users can add `--song-mode` (and `--follow-voice` for adaptive chords), or press **M** in the Windows console to toggle during playback.
 
+## v4.7 — Real-time audio stability and diagnostics
+
+This maintenance build responds to reports of crackling, delayed beats and intermittent audio in v4.6, even with Intelligent Song Mode disabled. The root cause on the reporter's Windows audio device has **not** yet been confirmed, so the changes target measurable risk factors without removing the features or changing saved settings.
+
+- **Audio buffer selector** under Audio routing: **Fast** (original low-latency behavior), **Balanced** (~30ms requested stream latency), or **Stable** (~65ms requested stream latency). The latter two can reduce Windows driver glitches **at the expense of extra monitoring delay**; actual latency depends on the driver. Change while STOPPED, then START LIVE. Default is **Fast** to avoid silently increasing latency.
+- **Live audio diagnostics** below START/STOP: average and peak DSP time per block, XRUNs, callbacks that exceeded the 10.67ms deadline, and dropped/gapped mic buffers in split-stream mode. Counters reset when you press START LIVE. An increasing XRUN or late-block count suggests driver or CPU deadline failures; a rising mic gap/drop count suggests incompatible or drifting input/output streams.
+- **Dropout smoothing:** When split input/output Windows streams briefly deliver no microphone audio, fade mic signal out and in rather than hard-switching to/from zero. This reduces digital clicks but cannot reconstruct missing recorded audio.
+- **Less GUI contention:** Visual meter snapshots are generated about half as often and the GUI redraws at ~15 FPS instead of 25 FPS. Settings autosaves run on a separate worker while playing (with a synchronous final save on exit) so Windows disk/file hooks do not stall Tk. Sound synthesis, instrument tempo, pitch-shifter waveforms and effect levels are unchanged.
+- **Adaptive CPU guard:** If the real-time Python processing thread consistently approaches/exceeds its block deadline, pitch *detection* temporarily runs every 2 or 3 blocks instead of every block. All eight backing voices, guitar, drums and bass remain available. Tracking returns to the full rate when there is headroom. This can add ~10–20ms to note detection under overload, but avoids heavier clicks from missed audio callbacks.
+
+### Recommended Windows troubleshooting steps
+
+1. **Try v4.7 with the same headphones and settings.** With headphones connected, select **Fast** first, begin monitoring and sing for 30–60 seconds with MAX CHAOS. Look at **XRUN**, **late**, **mic gaps**, and **mic drops**. Compare with Song Mode off; if counts still rise it is not solely Song Mode.
+2. If clicking continues, STOP, select **Balanced**, START LIVE again; if needed, retry **Stable**. These profiles can increase latency. If increasing the buffer does not help, switch back to Fast.
+3. Prefer a microphone and headphone output using the **same Windows host API** (both WASAPI or both MME, ideally same physical USB audio interface). Split-device compatibility mode makes input gaps more likely.
+4. If **late** increases rapidly but XRUN stays low, try CHOIR instead of WALL as a diagnostic. If **mic gaps/drops** increase, focus on audio routing rather than CPU. For testing, close other heavy apps, do not use Bluetooth headphones, and confirm 48kHz device formats.
+5. Send the line of **DSP / XRUN / late / mic gaps / mic drops** numbers together with whether you used Fast, Balanced or Stable. The counters make a targeted next fix possible.
+
+**Limitations:** These are synthetic and virtual-driver tests. Windows performance and actual audio latency cannot be verified without a representative physical microphone/headphone pair. Audio stability is not the same as feedback cancellation: use wired headphones at a safe starting volume.
+
 ## Quick start (Windows)
 
 1. Plug in **wired headphones** and lower Windows volume to a safe level. **Do not monitor through speakers**. Disable Windows **Listen to this device** and direct/hardware microphone monitoring if they produce an echo.
