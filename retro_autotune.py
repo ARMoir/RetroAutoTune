@@ -19,6 +19,8 @@ import traceback
 
 import numpy as np
 
+from song_mode import SongBrain
+
 SAMPLE_RATE = 48000
 HOP = 512
 PITCH_BUFFER = 3072
@@ -374,7 +376,7 @@ class BackingBand:
 
     def __init__(self, key="C", scale="minor", bpm=110, groove="pop",
                  drums_enabled=False, bass_enabled=False, guitar_enabled=False,
-                 follow_voice=False, follow_strength=0.50, drum_level=0.42, bass_level=0.42,
+                 follow_voice=False, follow_strength=0.50, song_mode=False, drum_level=0.42, bass_level=0.42,
                  guitar_level=0.42, band_level=0.75):
         self.bpm = int(bpm)
         self.groove = groove
@@ -383,6 +385,8 @@ class BackingBand:
         self.guitar_enabled = bool(guitar_enabled)
         self.follow_voice = bool(follow_voice)
         self.follow_strength = float(np.clip(follow_strength, 0.0, 1.0))
+        self.song = SongBrain(sample_rate=SAMPLE_RATE, hop=HOP, enabled=song_mode)
+        self.song_mix = np.ones(3, dtype=np.float32)
         self.drum_level = float(drum_level)
         self.bass_level = float(bass_level)
         self.guitar_level = float(guitar_level)
@@ -435,6 +439,7 @@ class BackingBand:
                 self.guitar_samples[(degree, direction)] = strum
         self.pitch_evidence.fill(0.0)
         self.voiced_updates = 0
+        self.song.reset()  # A changed key/scale invalidates remembered chord degrees.
         self.chord_degree = 0
         self.last_chord_step = -16
         self.chord_name = NOTE_NAMES[(self.root + intervals[0]) % 12]
@@ -457,6 +462,7 @@ class BackingBand:
         old = self.voice_energy
         self.voice_energy += (0.16 if energy > old else 0.045) * (energy - old)
         self.voice_onset = max(self.voice_onset * 0.91, max(0.0, energy - old))
+        self.song.observe(note if voiced else None, confidence, rms, self.step_index)
         if self.follow_voice:
             # Higher follow strength emphasizes recent sung notes more strongly.
             self.pitch_evidence *= 0.997 - 0.010 * self.follow_strength
@@ -519,10 +525,20 @@ class BackingBand:
         pos, bar = step % 16, step // 16
         if self.follow_voice:
             if step % self.follow_step_interval() == 0:
-                self._choose_adaptive_chord()
+                # When a remembered melodic motif returns, prefer the chord
+                # timeline from its first appearance over independent changes.
+                remembered = self.song.remembered_chord(step)
+                if remembered is None:
+                    self._choose_adaptive_chord()
+                else:
+                    self.chord_degree = remembered
+                    self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[remembered]) % 12]
+                    self.pitch_evidence *= 0.30
+                    self.voiced_updates = 0
         elif pos == 0:
-                self.chord_degree = self._degree_from_root_interval(self.chords[bar % len(self.chords)])
-                self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[self.chord_degree]) % 12]
+            self.chord_degree = self._degree_from_root_interval(self.chords[bar % len(self.chords)])
+            self.chord_name = NOTE_NAMES[(self.root + self.degree_intervals[self.chord_degree]) % 12]
+        self.song.on_step(step, self.chord_degree)
         if self.groove == "dance":
             kick_steps, snare_steps = (0, 4, 8, 12), (4, 12)
         elif self.groove == "half-time":
@@ -533,6 +549,9 @@ class BackingBand:
             if pos in kick_steps:
                 drum_events.append((self.drum_samples["kick"], offset))
             if pos in snare_steps:
+                drum_events.append((self.drum_samples["snare"], offset))
+            # A small pickup at section changes, without modifying tempo.
+            if self.song.enabled and pos == 14 and self.song.pending_section == "CHORUS":
                 drum_events.append((self.drum_samples["snare"], offset))
             if pos % 2 == 0 or (self.follow_voice and self.voice_onset > 0.22 and pos % 4 == 0):
                 drum_events.append((self.drum_samples["hat"], offset))
@@ -567,9 +586,11 @@ class BackingBand:
         drum_gain = 0.77 + 0.26 * dynamics
         bass_gain = 0.82 + 0.25 * dynamics
         guitar_gain = 0.75 + 0.36 * dynamics
-        return self.band_level * (drums * self.drum_level * self.drum_fade * drum_gain +
-                                  bass * self.bass_level * self.bass_fade * bass_gain +
-                                  guitar * self.guitar_level * self.guitar_fade * guitar_gain)
+        goals = np.asarray(self.song.arrangement(), dtype=np.float32)
+        self.song_mix += 0.035 * (goals - self.song_mix)
+        return self.band_level * (drums * self.drum_level * self.drum_fade * drum_gain * self.song_mix[0] +
+                                  bass * self.bass_level * self.bass_fade * bass_gain * self.song_mix[1] +
+                                  guitar * self.guitar_level * self.guitar_fade * guitar_gain * self.song_mix[2])
 
 
 # Each entry describes a synthetic backing singer: diatonic position, pan,
@@ -596,7 +617,7 @@ class VoiceEffects:
                  retune=1.0, mono_output=False, backing_vocals="off",
                  harmony_level=0.55, drums=False, bass=False, guitar=False, follow_voice=False, bpm=110,
                  groove="pop", band_level=0.75, drum_level=0.42, bass_level=0.42,
-                 guitar_level=0.42, voice_octave=0, follow_strength=0.50):
+                 guitar_level=0.42, voice_octave=0, follow_strength=0.50, song_mode=False):
         if voice_octave not in (-1, 0, 1):
             raise ValueError("voice_octave must be -1, 0, or +1")
         self.voice_octave = int(voice_octave)
@@ -614,7 +635,7 @@ class VoiceEffects:
         self.harmony_level = float(harmony_level)
         self.band = BackingBand(key=key, scale=scale, bpm=bpm, groove=groove,
                                 drums_enabled=drums, bass_enabled=bass, guitar_enabled=guitar,
-                                follow_voice=follow_voice, follow_strength=follow_strength, band_level=band_level,
+                                follow_voice=follow_voice, follow_strength=follow_strength, song_mode=song_mode, band_level=band_level,
                                 drum_level=drum_level, bass_level=bass_level,
                                 guitar_level=guitar_level)
         self.music_duck = 1.0
@@ -898,7 +919,7 @@ def run(args):
         mono_output=not args.stereo, backing_vocals=args.backing_vocals,
         harmony_level=args.harmony_level, drums=args.drums, bass=args.bass,
         guitar=args.guitar, follow_voice=args.follow_voice,
-        follow_strength=args.follow_strength,
+        follow_strength=args.follow_strength, song_mode=args.song_mode,
         bpm=args.bpm, groove=args.groove, band_level=args.band_level,
         drum_level=args.drum_level, bass_level=args.bass_level,
         guitar_level=args.guitar_level,
@@ -935,11 +956,12 @@ def run(args):
           f"| lead octave {args.voice_octave:+d}")
     print(f"Backing vocals {args.backing_vocals} | drums {'ON' if args.drums else 'OFF'} "
           f"| bass {'ON' if args.bass else 'OFF'} | guitar {'ON' if args.guitar else 'OFF'} "
-          f"| follow {'ON' if args.follow_voice else 'OFF'} | {args.bpm} BPM | {args.groove} groove")
+          f"| follow {'ON' if args.follow_voice else 'OFF'} | Song Mode {'ON' if args.song_mode else 'OFF'} "
+          f"| {args.bpm} BPM | {args.groove} groove")
     print("Wired headphones recommended; disable Windows 'Listen to this device' / hardware monitoring.")
     if sys.platform == "win32":
         print("Keys: E=extreme, R=reverb, H=backing vocals, D=drums, B=bass, G=guitar, F=follow voice, "
-              "O=lead octave (normal/up/down), [ / ]=tempo -/+5, "
+              "M=Song Mode, O=lead octave (normal/up/down), [ / ]=tempo -/+5, "
               "+/-=reverb level, Q=quit.")
     else:
         print("Ctrl+C to stop. Presets/reverb can be set via command line.")
@@ -982,6 +1004,8 @@ def run(args):
                             processor.band.guitar_enabled = not processor.band.guitar_enabled
                         elif keypress == "f":
                             processor.band.follow_voice = not processor.band.follow_voice
+                        elif keypress == "m":
+                            processor.band.song.set_enabled(not processor.band.song.enabled)
                         elif keypress == "o":
                             processor.voice_octave = {0: 1, 1: -1, -1: 0}[processor.voice_octave]
                         elif keypress == "[":
@@ -1000,7 +1024,8 @@ def run(args):
                       f"| octave {processor.voice_octave:+d} | harm {processor.harmony_mode:<5} | D {'ON' if processor.band.drums_enabled else 'off'} "
                       f"B {'ON' if processor.band.bass_enabled else 'off'} "
                       f"G {'ON' if processor.band.guitar_enabled else 'off'} | follow {'ON' if processor.band.follow_voice else 'off'} "
-                      f"| chord {processor.band.chord_name:<3} | {processor.band.bpm:>3} BPM   ",
+                      f"| chord {processor.band.chord_name:<3} | Song {processor.band.song.section if processor.band.song.enabled else 'OFF':<6} "
+                      f"| {processor.band.bpm:>3} BPM   ",
                       end="", flush=True)
     except KeyboardInterrupt:
         print("\nMonitoring stopped.")
@@ -1044,6 +1069,7 @@ def main():
     parser.add_argument("--bass", action="store_true", help="Start with synthesized bass enabled")
     parser.add_argument("--guitar", action="store_true", help="Start with synthesized strummed guitar enabled")
     parser.add_argument("--follow-voice", action="store_true", help="Singer selects chords on bar boundaries and affects band dynamics")
+    parser.add_argument("--song-mode", action="store_true", help="Offline phrase memory and verse/chorus-like adaptive band arrangement")
     parser.add_argument("--follow-strength", type=float, default=0.50,
                         help="Singer-follow intensity 0.0..1.0: from laid-back 2-bar to beat-level chord updates")
     parser.add_argument("--bpm", type=int, default=110, help="Tempo for drums and bass (60..180)")

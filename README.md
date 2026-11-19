@@ -4,6 +4,8 @@
 
 ![Retro Auto-Tune GUI preview](assets/gui_preview.png)
 
+> **v4.5 — Intelligent Song Mode (offline prototype):** The optional **♪ INTELLIGENT SONG MODE** button adds a musical phrase-memory engine. It listens to stable, pitched vocal notes (not the microphone recording), segments phrases on short pauses, matches repeated melodies despite moderate timing variation or transposition, remembers beat-aligned accompaniment chords, and recognizes verse-/chorus-like moments. The band subtly changes guitar, bass and drum intensity at bar boundaries, and brings back remembered chords when a familiar melody returns. The display shows **INTRO**, **VERSE**, **CHORUS**, or **BREAK**, plus phrases/repeats learned. Song Mode starts **OFF** to preserve v4.4's sound; MAX CHAOS stays independent. Everything runs locally without AI, internet, music files, or new pip dependencies. This is a heuristic first version, not full automatic song composition or reliable formal music analysis.
+
 > **v4.4 — MAX CHAOS, MP3 recording, responsive UI and adjustable vocal following:** Click **★ MAX CHAOS** to turn on Extreme tuning, WALL harmonies, huge reverb, full drums/bass/guitar and tight voice-following together. Click again to restore the settings you had before; **headphone volume is never increased by this button**. Click **● RECORD MP3** while live, choose a destination, and click **■ STOP RECORDING** to finalize a 192 kb/s MP3 of the **entire processed headphone mix** (not raw mic), including band, choir and reverb. The included `imageio-ffmpeg` package provides the encoder, which runs on a worker thread to avoid blocking real-time audio. The window now reflows between three, two, and one control columns as you resize it, with vertical scrolling for smaller displays. The **VOICE FOLLOW INTENSITY** slider controls how often bass and guitar reconsider chords: 0–0.29 every two bars, 0.30–0.64 every bar (v4.3-style), 0.65–0.89 every two beats, and 0.90–1.00 each beat. Drums remain tempo-locked; higher values also increase voice-responsive dynamics. The **FOLLOW MY VOICE** button still turns adaptive accompaniment on or off entirely. Keep your Windows headphone volume moderate!
 
 > **v4.3 — Voice-following backing band:** Add an original synthetic strummed guitar, and turn on **FOLLOW MY VOICE / ADAPT CHORDS** to have the guitar and bass harmonize with stable melody-derived chords while the drum groove reacts to vocal dynamics. Chords change **on bar boundaries** to avoid jittery per-note backing. Click **GUITAR** and **FOLLOW MY VOICE** to enable/disable them independently. With Follow off, the old fixed four-chord progression remains. The display shows the current backing chord. Singing controls chords, *not the BPM*.
@@ -21,6 +23,18 @@ This is a **future goal, not an existing supported hardware build**. The Raspber
 **Design principle for future changes:** Keep audio processing platform-independent and independent of the desktop GUI; favor scalable, touch-friendly layouts, reusable controls, low audio latency, safe headphone monitoring, and headless operation. Do not compromise the working Windows version to pursue the hardware prototype.
 
 See **[MicStation hardware roadmap](docs/MICSTATION_ROADMAP.md)** for phased implementation, hardware considerations, success criteria and risks.
+
+## Intelligent Song Mode — quick experiment
+
+1. Start the GUI as usual, plug in **wired headphones**, and select your microphone/headphones.
+2. Turn on **DRUMS, BASS, GUITAR, FOLLOW MY VOICE**, and **♪ INTELLIGENT SONG MODE** (in the backing-band panel). MAX CHAOS is optional, not required.
+3. Sing a **four-to-eight-note melody** clearly, with enough time to hold the notes, then pause for roughly half a second.
+4. Repeat the melody a couple of times, optionally transposing it slightly. The status should accumulate **phrases / repeats**. A repeated phrase can trigger a **CHORUS-like** section at the next eligible bar boundary; sections have a short hold time so they do not flicker.
+5. Try a new phrase to return toward **VERSE** or stop singing and listen to the quieter **BREAK**. The band continues to obey your BPM and selected key/scale.
+
+**Important:** song structure is inferred from musical patterns, *not* lyrics. Simple repeated phrases may be called a chorus even if they are not one. Very short phrases, background noise, inconsistent pitch detection and unfamiliar melodies may not be recognized. The first occurrence of a phrase teaches the song memory; when its opening notes return, the band can replay the earlier beat-aligned chord pattern. The current follow-strength slider still sets adaptive chord change cadence, and the Song Mode switch can be toggled live. Turn it **OFF** to restore the original v4.4 accompaniment. Changing key or scale clears song memory to avoid replaying chords from the old key.
+
+CLI users can add `--song-mode` (and `--follow-voice` for adaptive chords), or press **M** in the Windows console to toggle during playback.
 
 ## Quick start (Windows)
 
@@ -41,6 +55,7 @@ See **[MicStation hardware roadmap](docs/MICSTATION_ROADMAP.md)** for phased imp
 - **Reverb:** Cher-inspired late-'90s/2000s stereo pop plate, slapback echoes, and smooth tails.
 - **Drums, bass & guitar:** Original synthesized instruments. The optional guitar strums chords; the bass plays roots and fifths; the drummer stays on a steady tempo with dynamically accented hits.
 - **Adjustable vocal-following:** Uses confidently detected sung notes to choose compatible diatonic chords on the beat grid. The slider makes chord changes slower or faster (two bars to one beat), with a little hysteresis so sustained common chord tones do not create constant jitter. The band follows your melody without trying to infer BPM. Disable FOLLOW MY VOICE for the fixed four-chord progression.
+- **Intelligent Song Mode:** Offline phrase learning, repeated-melody matching, remembered chord timelines, and section-sensitive backing dynamics; optional and disabled by default.
 - **MAX CHAOS:** Reversible one-click full effects preset. It does not raise headphone monitoring volume.
 - **MP3 performance recording:** Start and stop recording in the live GUI; export 192 kb/s mono/stereo MP3 of the processed headphone mix using a separate encoder thread. The output folder is selected with the Save dialog.
 - **Resolution-aware visual studio:** Scrollable interface with control-panel reflow for smaller screens, plus waveform, spectrum analyzer, pitch display, mic/output meters, and beat indicator. GUI visuals run outside the audio callback.
@@ -79,16 +94,18 @@ Run the audio-engine self-test and GUI/routing/band tests without connecting a m
 
 ```powershell
 py retro_autotune.py --selftest
-py -m unittest test_gui test_features -v
+py -m unittest test_gui test_features test_song_mode -v
 ```
 
-The new routing tests simulate incompatible Windows host API pairs and a PortAudio `-9993` failure. They do not prove how any particular microphone/headphone driver will behave; real-time listening is the final test.
+The new phrase tests use synthetic note sequences, including transposition and false-note rejection; they do not prove that a real song will be analyzed correctly. The routing tests simulate incompatible Windows host API pairs and a PortAudio `-9993` failure. They do not prove how any particular microphone/headphone driver will behave; real-time listening is the final test.
 
 ## Dependencies & project structure
 
 Python, `numpy`, `sounddevice`, `imageio-ffmpeg`, and Tkinter (typically included with Windows Python). `INSTALL.bat` installs the Python packages. No external audio files or cloud services are required. MP3 encoding ships through the `imageio-ffmpeg` Python wheel; no manual FFmpeg setup is necessary on supported Windows systems. On unsupported platforms/architectures, encoding may require a working compatible FFmpeg binary.
 
 - `retro_autotune_gui.py`: desktop UI + live audio worker, including split-stream compatibility
+- `song_mode.py`: portable, offline phrase memory and section detection (Python standard library only)
+- `test_song_mode.py`: synthetic phrase recognition, chord recall and compatibility tests
 - `retro_autotune.py`: pitch processing, effects, singing-responsive bass, synthesised guitar, tempo-locked drums, and console mode
 - `requirements.txt`: Python dependencies
 - `test_gui.py`: GUI-controls and fake-PortAudio routing tests

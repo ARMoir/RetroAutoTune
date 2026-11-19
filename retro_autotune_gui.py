@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neon live studio interface for the Retro Auto-Tune v4.4 audio engine.
+"""Neon live studio interface for the Retro Auto-Tune v4.5 audio engine.
 
 Tkinter only for controls/visuals, NumPy and sounddevice for audio.
 No Tk functions run on the PortAudio callback thread. Use wired headphones.
@@ -118,6 +118,8 @@ class AudioWorker:
             fx.band.guitar_enabled = bool(value)
         elif name == "follow_voice":
             fx.band.follow_voice = bool(value)
+        elif name == "song_mode":
+            fx.band.song.set_enabled(bool(value))
         elif name == "follow_strength":
             fx.band.follow_strength = float(np.clip(value, 0.0, 1.0))
         elif name == "guitar_level":
@@ -184,6 +186,7 @@ class AudioWorker:
                 drums=c["drums"], bass=c["bass"], guitar=c.get("guitar", False),
                 follow_voice=c.get("follow_voice", False),
                 follow_strength=c.get("follow_strength", 0.50),
+                song_mode=c.get("song_mode", False),
                 guitar_level=c.get("guitar_level", 0.42), bpm=c["bpm"],
                 bass_level=c.get("bass_level", 0.42),
                 drum_level=c.get("drum_level", 0.42),
@@ -231,6 +234,10 @@ class AudioWorker:
                             "chord": fx.band.chord_name,
                             "follow_voice": fx.band.follow_voice,
                             "follow_strength": fx.band.follow_strength,
+                            "song_mode": fx.band.song.enabled,
+                            "section": fx.band.song.section if fx.band.song.enabled else "OFF",
+                            "phrases": fx.band.song.phrases_heard,
+                            "repeats": fx.band.song.repeats_heard,
                             "confidence": fx.last_confidence if fx.gate_level > 0.10 else 0.0,
                             "beat": fx.band.step_index // 4 % 4,
                             "step": fx.band.step_index,
@@ -345,6 +352,7 @@ class StudioApp:
         self.note_var = tk.StringVar(value="--")
         self.pitch_var = tk.StringVar(value="Sing into the microphone")
         self.chord_var = tk.StringVar(value="Backing chord: --")
+        self.song_var = tk.StringVar(value="SONG MODE  ·  OFF")
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.headphones_var = tk.BooleanVar(value=False)
@@ -358,6 +366,7 @@ class StudioApp:
         self.bass_var = tk.BooleanVar(value=True)
         self.guitar_var = tk.BooleanVar(value=True)
         self.follow_voice_var = tk.BooleanVar(value=True)
+        self.song_mode_var = tk.BooleanVar(value=False)
         self.follow_strength_var = tk.DoubleVar(value=0.50)
         self.guitar_level_var = tk.DoubleVar(value=0.42)
         self.drum_level_var = tk.DoubleVar(value=0.42)
@@ -522,7 +531,9 @@ class StudioApp:
         self._label(pitch_panel, "", MUTED, 10, False,
                     textvariable=self.pitch_var).pack(pady=(0, 5))
         self._label(pitch_panel, "", LIME, 11, True,
-                    textvariable=self.chord_var).pack(pady=(0, 8))
+                    textvariable=self.chord_var).pack(pady=(0, 3))
+        self._label(pitch_panel, "", CYAN, 9, True,
+                    textvariable=self.song_var).pack(pady=(0, 4))
         tk.Frame(pitch_panel, bg=PANEL, height=5).pack(pady=5)
 
         meters = tk.Frame(body, bg=BG)
@@ -626,7 +637,10 @@ class StudioApp:
         self.guitar_btn = self._button(instruments, "GUITAR", self._toggle_guitar)
         self.guitar_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
         self.follow_btn = self._button(band, "FOLLOW MY VOICE / ADAPT CHORDS", self._toggle_follow_voice)
-        self.follow_btn.pack(fill="x", padx=14, pady=(0, 8))
+        self.follow_btn.pack(fill="x", padx=14, pady=(0, 5))
+        self.song_btn = self._button(band, "♪  INTELLIGENT SONG MODE", self._toggle_song_mode)
+        self.song_btn.pack(fill="x", padx=14, pady=(0, 8))
+        self._label(band, "Learns recurring melodies · shapes verse / chorus", MUTED, 9).pack(anchor="w", padx=14, pady=(0, 6))
         self._slider(band, "VOICE FOLLOW INTENSITY  /  RELAXED → TIGHT", self.follow_strength_var,
                      0.0, 1.0, lambda v: self._send("follow_strength", round(float(v), 2)))
         self._slider(band, "GUITAR LEVEL", self.guitar_level_var, 0.0, 1.0,
@@ -647,7 +661,7 @@ class StudioApp:
         self._button(bpmrow, "+ 5", lambda: self._set_bpm(self.bpm_var.get()+5)).pack(side="right")
         self._label(band, "Tempo-locked drums · vocal-guided bass & guitar chords", MUTED, 9).pack(anchor="w", padx=14, pady=12)
 
-        self._label(body, "v4.4  ·  Max Chaos, MP3 recording & tighter voice-follow  ·  wired headphones only",
+        self._label(body, "v4.5  ·  Offline Intelligent Song Mode · MAX CHAOS · wired headphones only",
                     MUTED, 9).pack(padx=18, pady=(0, 24))
         self._sync_controls()
         self._wave_grid()
@@ -848,6 +862,15 @@ class StudioApp:
         self._send("follow_voice", self.follow_voice_var.get())
         self._sync_controls()
 
+    def _toggle_song_mode(self):
+        self.song_mode_var.set(not self.song_mode_var.get())
+        self._send("song_mode", self.song_mode_var.get())
+        if not self.song_mode_var.get():
+            self.song_var.set("SONG MODE  ·  OFF")
+        else:
+            self.song_var.set("SONG MODE  ·  INTRO / LEARNING")
+        self._sync_controls()
+
     def _set_octave(self, value):
         self.octave_var.set(value)
         self._send("voice_octave", value)
@@ -866,6 +889,8 @@ class StudioApp:
         self._update_button(self.bass_btn, self.bass_var.get(), LIME)
         self._update_button(self.guitar_btn, self.guitar_var.get(), LIME)
         self._update_button(self.follow_btn, self.follow_voice_var.get(), CYAN)
+        self._update_button(self.song_btn, self.song_mode_var.get(), LIME)
+        self.song_btn.configure(text="♪  SONG MODE  ON" if self.song_mode_var.get() else "♪  INTELLIGENT SONG MODE")
         for mode, btn in self.harmony_buttons.items():
             self._update_button(btn, self.harmony_var.get() == mode, CYAN)
         for octave, btn in self.octave_buttons.items():
@@ -904,6 +929,7 @@ class StudioApp:
             "bass": self.bass_var.get(), "guitar": self.guitar_var.get(),
             "follow_voice": self.follow_voice_var.get(), "guitar_level": self.guitar_level_var.get(),
             "follow_strength": self.follow_strength_var.get(),
+            "song_mode": self.song_mode_var.get(),
             "drum_level": self.drum_level_var.get(), "bass_level": self.bass_level_var.get(),
             "band_level": self.band_level_var.get(),
             "bpm": self.bpm_var.get(), "groove": self.groove_var.get(),
@@ -1025,6 +1051,12 @@ class StudioApp:
         self.note_var.set(snap["note"])
         self.chord_var.set("Backing chord: " + snap.get("chord", "--") +
                            ("  • FOLLOW" if snap.get("follow_voice") else "  • FIXED"))
+        if snap.get("song_mode"):
+            self.song_var.set("SONG  " + snap.get("section", "INTRO") +
+                              "  ·  " + str(snap.get("phrases", 0)) + " phrases / " +
+                              str(snap.get("repeats", 0)) + " repeats")
+        else:
+            self.song_var.set("SONG MODE  ·  OFF")
         self.pitch_var.set(f"Pitch confidence {snap['confidence']*100:.0f}%" if snap["note"] != "--" else "Waiting for vocals")
         for var, level, canvas, color in (
             (self.input_level_var, snap["input_db"], self.mic_meter, CYAN),

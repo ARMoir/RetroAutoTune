@@ -8,7 +8,10 @@ app = StudioApp(root)
 root.update()
 t = np.arange(2048) / 48000
 signal = (0.35*np.sin(2*np.pi*440*t)+0.18*np.sin(2*np.pi*880*t)+0.07*np.sin(2*np.pi*1320*t)).astype('float32')
+app.song_mode_var.set(True)
+app._sync_controls()
 app._draw_visuals({'samples':signal,'note':'A4','chord':'Am', 'follow_voice':True,
+                   'song_mode':True, 'section':'CHORUS', 'phrases':6, 'repeats':2,
                    'confidence':.98,'input_db':-16,'output_db':-20,'beat':1})
 app.status_var.set('PREVIEW · Simulated vocal, no microphone')
 root.update()
